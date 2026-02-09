@@ -1,0 +1,45 @@
+# MetaTrader Repository .gitignore
+
+# MT5 Data/History - NIEMALS committen! (fixes permission denied)
+Bases/
+history/
+*.hcc
+*.hst
+*.his
+
+# Ignorierte Ordner
+MQL5/Logs/
+MQL5/Services/
+
+# Binäre Dateien in MQL5 und allen Unterordnern ausschließen
+MQL5/**/*.ex5
+MQL5/**/*.ex4
+
+# IDE und temporäre Dateien
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Build Artefakte
+*.obj
+*.o
+*.exe
+*.dll
+
+# Ausnahmen - explizit erlaubte Dateien/Ordner
+!Profiles/
+!Profiles/Templates/
+!Sounds/
+!MQL5/
+!Config/
+!Config/metaeditor.ini
+
+# Erlaubte Quelldateien in MQL5 (nicht-binär)
+!MQL5/**/*.mq5
+!MQL5/**/*.mq4
+!MQL5/**/*.mqh
+!MQL5/**/*.mql5
+!MQL5/**/*.mql4

@@ -1,0 +1,18 @@
+# Global MQL5 & Project Routing Rules
+
+## 1. Global Coding Standards
+- **Language:** Strictly ENGLISH comments and documentation only.
+- **MQL5 Syntax:** Use modern MQL5 (C++ style). No MT4 compatibility.
+- **File Integrity:** Always output CHANGED files in their entirety. Never provide truncated code.
+- **Hardware Context:** Development is optimized for AMD Ryzen 9 7950X3D and NVIDIA RTX 5080. Leverage CUDA for Python-based ML tasks.
+
+## 2. Project-Specific Routing (CRITICAL)
+- This repository contains multiple projects. You must check the file path before generating logic.
+- **IF working in:** `MQL5/Experts/trade-commander/ntcp/`
+  - **THEN:** You MUST prioritize the rules and logic defined in `@MQL5/Experts/trade-commander/ntcp/docs/ntcp_master_spec.md`.
+  - Do not apply NTCP's normalization or MA-spectrum to other projects.
+
+## 3. Development Environment
+- OS: Windows 11 Pro (MQL5/GUI) & Ubuntu 22.04 VM (ML Workflows).
+- IDEs: Cursor, Claude Code, MetaEditor.
+- AI Usage: Modular code design to support automatic generation of help centers/documentation.

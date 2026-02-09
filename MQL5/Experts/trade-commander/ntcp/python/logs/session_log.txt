@@ -1,0 +1,6 @@
+[14:08:02] NTCP initialized.
+[12:47:41] NTCP initialized.
+[16:32:33] NTCP initialized.
+[16:44:08] NTCP initialized.
+[16:49:37] NTCP initialized.
+[16:59:05] NTCP initialized.
