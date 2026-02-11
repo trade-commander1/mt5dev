@@ -3,13 +3,13 @@
   "window": {
     "width": 860,
     "height": 1002,
-    "position_x": 902,
-    "position_y": 349
+    "position_x": 3020,
+    "position_y": 321
   },
   "data_manager": {
     "last_data_file": "D:/trading/QuantDataManager/export/DUKASCOPY_XAUUSD_M1.csv",
     "native_bar_period": "1M",
-    "target_bar_period": "5M",
+    "target_bar_period": "15M",
     "day_offset": 20,
     "symbol_name": "",
     "mintick": 0.01,
@@ -58,5 +58,5 @@
     "output_dir": "",
     "device": "CPU"
   },
-  "last_saved": "2026-02-11T15:56:14.710618"
+  "last_saved": "2026-02-11T17:07:46.354599"
 }
