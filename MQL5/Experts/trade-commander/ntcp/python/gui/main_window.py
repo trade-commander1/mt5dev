@@ -8,6 +8,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+import pyqtgraph as pg
 import torch
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -36,10 +38,6 @@ from PyQt6.QtWidgets import (
 
 from ..backtest import BacktestMetrics
 from ..config import (
-    MA_SPECTRUM,
-    MACD_FAST_PERIOD,
-    MACD_SLOW_PERIOD,
-    MACD_SIGNAL_PERIOD,
     HURST_WINDOW,
     REGIME_N_CLUSTERS,
     DataConfig,
@@ -73,6 +71,7 @@ class NTCPMainWindow(QMainWindow):
         self._backtest_worker: Optional[BacktestWorker] = None
         self._export_worker: Optional[ExportWorker] = None
         self._data_bar_count: int = 0
+        self._last_dm: Optional[NTCPDataManager] = None
 
         self._build_ui()
 
@@ -104,6 +103,8 @@ class NTCPMainWindow(QMainWindow):
         splitter.addWidget(self._log)
         splitter.setSizes([500, 200])
 
+        # Set initial visibility for strategy-dependent widgets
+        self._on_strategy_changed(0)
         self._log.log("NTCP initialized.")
 
     # ------------------------------------------------------------------
@@ -134,6 +135,44 @@ class NTCPMainWindow(QMainWindow):
         g.addWidget(self._data_info_label, 1, 1, 1, 2)
 
         layout.addWidget(grp)
+
+        # Symbol data
+        sym_grp = QGroupBox("Symbol Data")
+        sym_layout = QGridLayout(sym_grp)
+
+        sym_layout.addWidget(QLabel("Spread:"), 0, 0)
+        self._spread_spin = QDoubleSpinBox()
+        self._spread_spin.setRange(0.0, 100.0)
+        self._spread_spin.setDecimals(2)
+        self._spread_spin.setSingleStep(0.01)
+        self._spread_spin.setValue(0.20)
+        sym_layout.addWidget(self._spread_spin, 0, 1)
+
+        sym_layout.addWidget(QLabel("Point:"), 0, 2)
+        self._point_spin = QDoubleSpinBox()
+        self._point_spin.setRange(0.00001, 100.0)
+        self._point_spin.setDecimals(5)
+        self._point_spin.setSingleStep(0.00001)
+        self._point_spin.setValue(0.01)
+        sym_layout.addWidget(self._point_spin, 0, 3)
+
+        sym_layout.addWidget(QLabel("Tick Value $:"), 0, 4)
+        self._tick_value_spin = QDoubleSpinBox()
+        self._tick_value_spin.setRange(0.001, 10000.0)
+        self._tick_value_spin.setDecimals(3)
+        self._tick_value_spin.setSingleStep(0.1)
+        self._tick_value_spin.setValue(1.00)
+        sym_layout.addWidget(self._tick_value_spin, 0, 5)
+
+        sym_layout.addWidget(QLabel("Slippage (pts):"), 1, 0)
+        self._slippage_spin = QDoubleSpinBox()
+        self._slippage_spin.setRange(0.0, 100.0)
+        self._slippage_spin.setDecimals(1)
+        self._slippage_spin.setSingleStep(1.0)
+        self._slippage_spin.setValue(0.0)
+        sym_layout.addWidget(self._slippage_spin, 1, 1)
+
+        layout.addWidget(sym_grp)
 
         # Validation split
         split_grp = QGroupBox("Validation Split")
@@ -196,6 +235,18 @@ class NTCPMainWindow(QMainWindow):
                 f"(~{train_bars} train / ~{val_bars} val)"
             )
 
+    def _on_strategy_changed(self, index: int) -> None:
+        """Show/hide MA Filter parameter group based on selected strategy."""
+        strategy = self._strategy_combo.currentData()
+        is_maf = strategy == "mafilter"
+        self._mafilter_grp.setVisible(is_maf)
+        # Backtest tab: swap CRV (trendcatcher) ↔ Cls Confidence (mafilter)
+        if hasattr(self, "_crv_label"):
+            self._crv_label.setVisible(not is_maf)
+            self._crv_spin.setVisible(not is_maf)
+            self._cls_thresh_label.setVisible(is_maf)
+            self._cls_thresh_spin.setVisible(is_maf)
+
     # ------------------------------------------------------------------
     # Tab 2: Features & Factors
     # ------------------------------------------------------------------
@@ -226,6 +277,12 @@ class NTCPMainWindow(QMainWindow):
         self._lookback.setValue(20)
         fg.addWidget(self._lookback, 1, 1)
 
+        fg.addWidget(QLabel("Base TF (min):"), 1, 2)
+        self._base_tf = QSpinBox()
+        self._base_tf.setRange(1, 1440)
+        self._base_tf.setValue(1)
+        fg.addWidget(self._base_tf, 1, 3)
+
         layout.addWidget(factor_grp)
 
         # Feature groups (checkboxes) — in scrollable area
@@ -234,21 +291,19 @@ class NTCPMainWindow(QMainWindow):
 
         self._feat_checks: dict[str, QCheckBox] = {}
         groups = [
-            ("M5 Moving Averages (11)", "m5_ma", True),
-            ("M5 Standard Deviations (11)", "m5_sd", True),
-            ("M5 Slopes (11)", "m5_slope", True),
+            ("M5 Moving Averages", "m5_ma", True),
+            ("M5 Standard Deviations", "m5_sd", True),
+            ("M5 Slopes", "m5_slope", True),
             ("M5 RSI / ATR / Vol Z-Score", "m5_misc", True),
-            ("M5 MACD (line/signal/hist)", "m5_macd", True),
             ("M5 Candle Geometry", "m5_candle", True),
             ("M5 Squeeze / Daily H-L", "m5_range", True),
             ("M5 Cyclic Time", "m5_time", True),
             ("M5 Hurst Exponent", "m5_hurst", True),
-            ("M5 Market Regime (4)", "m5_regime", True),
-            ("STF Moving Averages (11)", "stf_ma", True),
-            ("STF Standard Deviations (11)", "stf_sd", True),
-            ("STF Slopes (11)", "stf_slope", True),
+            ("M5 Market Regime", "m5_regime", True),
+            ("STF Moving Averages", "stf_ma", True),
+            ("STF Standard Deviations", "stf_sd", True),
+            ("STF Slopes", "stf_slope", True),
             ("STF RSI / ATR / Vol / OHLC", "stf_misc", True),
-            ("STF MACD (line/signal/hist)", "stf_macd", True),
             ("STF Squeeze", "stf_squeeze", True),
             ("STF Hurst Exponent", "stf_hurst", True),
         ]
@@ -260,47 +315,124 @@ class NTCPMainWindow(QMainWindow):
 
         layout.addWidget(feat_grp)
 
-        # Feature parameters group
+        # MA Spectrum
+        ma_grp = QGroupBox("MA Spectrum")
+        mg = QGridLayout(ma_grp)
+
+        mg.addWidget(QLabel("Min MA:"), 0, 0)
+        self._ma_min = QSpinBox()
+        self._ma_min.setRange(2, 100)
+        self._ma_min.setValue(5)
+        mg.addWidget(self._ma_min, 0, 1)
+
+        mg.addWidget(QLabel("Max MA:"), 0, 2)
+        self._ma_max = QSpinBox()
+        self._ma_max.setRange(10, 2000)
+        self._ma_max.setValue(500)
+        mg.addWidget(self._ma_max, 0, 3)
+
+        mg.addWidget(QLabel("MA Count:"), 1, 0)
+        self._ma_count = QSpinBox()
+        self._ma_count.setRange(2, 30)
+        self._ma_count.setValue(11)
+        mg.addWidget(self._ma_count, 1, 1)
+
+        mg.addWidget(QLabel("Signal MAs (N):"), 1, 2)
+        self._signal_ma_count = QSpinBox()
+        self._signal_ma_count.setRange(1, 20)
+        self._signal_ma_count.setValue(4)
+        mg.addWidget(self._signal_ma_count, 1, 3)
+
+        layout.addWidget(ma_grp)
+
+        # Strategy
+        strat_grp = QGroupBox("Strategy")
+        strat_layout = QVBoxLayout(strat_grp)
+        strat_row = QHBoxLayout()
+        strat_row.addWidget(QLabel("Strategy:"))
+        self._strategy_combo = QComboBox()
+        self._strategy_combo.addItem("Trendcatcher", "trendcatcher")
+        self._strategy_combo.addItem("MA Filter", "mafilter")
+        self._strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
+        strat_row.addWidget(self._strategy_combo)
+        strat_row.addStretch()
+        strat_layout.addLayout(strat_row)
+
+        # MA Filter parameters (shown/hidden based on strategy selection)
+        self._mafilter_grp = QGroupBox("MA Filter Parameters")
+        mf = QGridLayout(self._mafilter_grp)
+
+        mf.addWidget(QLabel("NH (BW SMA window):"), 0, 0)
+        self._mf_nh = QSpinBox()
+        self._mf_nh.setRange(10, 10000)
+        self._mf_nh.setValue(1000)
+        mf.addWidget(self._mf_nh, 0, 1)
+
+        mf.addWidget(QLabel("Min Slope Factor:"), 0, 2)
+        self._mf_fac_slope = QDoubleSpinBox()
+        self._mf_fac_slope.setRange(0.0, 5.0)
+        self._mf_fac_slope.setDecimals(2)
+        self._mf_fac_slope.setSingleStep(0.1)
+        self._mf_fac_slope.setValue(0.5)
+        mf.addWidget(self._mf_fac_slope, 0, 3)
+
+        mf.addWidget(QLabel("Fslope Thresh:"), 1, 0)
+        self._mf_fslope_thresh = QDoubleSpinBox()
+        self._mf_fslope_thresh.setRange(0.0, 1.0)
+        self._mf_fslope_thresh.setDecimals(2)
+        self._mf_fslope_thresh.setSingleStep(0.05)
+        self._mf_fslope_thresh.setValue(0.8)
+        mf.addWidget(self._mf_fslope_thresh, 1, 1)
+
+        mf.addWidget(QLabel("Max BW Factor:"), 1, 2)
+        self._mf_max_bw_factor = QDoubleSpinBox()
+        self._mf_max_bw_factor.setRange(0.1, 10.0)
+        self._mf_max_bw_factor.setDecimals(2)
+        self._mf_max_bw_factor.setSingleStep(0.1)
+        self._mf_max_bw_factor.setValue(1.5)
+        mf.addWidget(self._mf_max_bw_factor, 1, 3)
+
+        mf.addWidget(QLabel("StdDev Factor:"), 2, 0)
+        self._mf_stddev_factor = QDoubleSpinBox()
+        self._mf_stddev_factor.setRange(0.0, 5.0)
+        self._mf_stddev_factor.setDecimals(2)
+        self._mf_stddev_factor.setSingleStep(0.1)
+        self._mf_stddev_factor.setValue(1.0)
+        mf.addWidget(self._mf_stddev_factor, 2, 1)
+
+        mf.addWidget(QLabel("Exit Option:"), 2, 2)
+        self._mf_exit_option = QComboBox()
+        self._mf_exit_option.addItem("A: StdDev Exit", 0)
+        self._mf_exit_option.addItem("B: Fslope Exit", 1)
+        mf.addWidget(self._mf_exit_option, 2, 3)
+
+        self._mafilter_grp.setVisible(False)
+        strat_layout.addWidget(self._mafilter_grp)
+        layout.addWidget(strat_grp)
+
+        # Feature parameters
         param_grp = QGroupBox("Feature Parameters")
         pg = QGridLayout(param_grp)
 
-        pg.addWidget(QLabel("MACD Fast:"), 0, 0)
-        self._macd_fast = QSpinBox()
-        self._macd_fast.setRange(2, 100)
-        self._macd_fast.setValue(MACD_FAST_PERIOD)
-        pg.addWidget(self._macd_fast, 0, 1)
-
-        pg.addWidget(QLabel("MACD Slow:"), 0, 2)
-        self._macd_slow = QSpinBox()
-        self._macd_slow.setRange(2, 200)
-        self._macd_slow.setValue(MACD_SLOW_PERIOD)
-        pg.addWidget(self._macd_slow, 0, 3)
-
-        pg.addWidget(QLabel("MACD Signal:"), 1, 0)
-        self._macd_signal = QSpinBox()
-        self._macd_signal.setRange(2, 100)
-        self._macd_signal.setValue(MACD_SIGNAL_PERIOD)
-        pg.addWidget(self._macd_signal, 1, 1)
-
-        pg.addWidget(QLabel("Hurst Window:"), 1, 2)
+        pg.addWidget(QLabel("Hurst Window:"), 0, 0)
         self._hurst_window = QSpinBox()
         self._hurst_window.setRange(10, 500)
         self._hurst_window.setValue(HURST_WINDOW)
-        pg.addWidget(self._hurst_window, 1, 3)
+        pg.addWidget(self._hurst_window, 0, 1)
 
-        pg.addWidget(QLabel("Regime Clusters:"), 2, 0)
+        pg.addWidget(QLabel("Regime Clusters:"), 0, 2)
         self._regime_clusters = QSpinBox()
         self._regime_clusters.setRange(2, 10)
         self._regime_clusters.setValue(REGIME_N_CLUSTERS)
-        pg.addWidget(self._regime_clusters, 2, 1)
+        pg.addWidget(self._regime_clusters, 0, 3)
 
-        pg.addWidget(QLabel("Rolling Window:"), 2, 2)
+        pg.addWidget(QLabel("Rolling Window:"), 1, 0)
         self._rolling_window = QSpinBox()
         self._rolling_window.setRange(0, 1_000_000)
         self._rolling_window.setSingleStep(10000)
         self._rolling_window.setValue(0)
         self._rolling_window.setSpecialValueText("No limit")
-        pg.addWidget(self._rolling_window, 2, 3)
+        pg.addWidget(self._rolling_window, 1, 1)
 
         layout.addWidget(param_grp)
         layout.addStretch()
@@ -351,7 +483,7 @@ class NTCPMainWindow(QMainWindow):
         self._lr.setRange(0.00001, 0.1)
         self._lr.setDecimals(5)
         self._lr.setSingleStep(0.0001)
-        self._lr.setValue(0.001)
+        self._lr.setValue(0.0001)
         hg.addWidget(self._lr, 1, 1)
 
         hg.addWidget(QLabel("Hidden Size:"), 1, 2)
@@ -409,12 +541,37 @@ class NTCPMainWindow(QMainWindow):
         self._stop_btn.clicked.connect(self._stop_training)
         cl.addWidget(self._stop_btn)
 
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.clicked.connect(self._clear_all)
+        cl.addWidget(self._clear_btn)
+
         self._progress = QProgressBar()
         self._progress.setValue(0)
         cl.addWidget(self._progress)
 
         layout.addWidget(ctrl_grp)
-        layout.addStretch()
+
+        # Live training monitor
+        self._monitor_plot = pg.PlotWidget()
+        self._monitor_plot.setBackground("#000000")
+        self._monitor_plot.showGrid(x=True, y=True, alpha=0.15)
+        self._monitor_plot.setTitle(
+            "Pred vs Actual — MFE 10-bar", color="#888888",
+        )
+        self._monitor_plot.setLabel("left", "Value (x100)")
+        self._monitor_plot.setLabel("bottom", "Sample (sorted)")
+        self._monitor_plot.addLegend(offset=(10, 10))
+        self._actual_curve = self._monitor_plot.plot(
+            [], pen=pg.mkPen(color="#44ff44", width=1.5), name="Actual",
+        )
+        self._pred_curve = self._monitor_plot.plot(
+            [], pen=pg.mkPen(color="#44ddff", width=1.5), name="Predicted",
+        )
+        self._monitor_plot.addLine(
+            y=0, pen=pg.mkPen(color="#333333", width=1, style=Qt.PenStyle.DashLine),
+        )
+        layout.addWidget(self._monitor_plot, 1)
+
         return tab
 
     def _get_active_feature_groups(self) -> list[str]:
@@ -428,15 +585,28 @@ class NTCPMainWindow(QMainWindow):
     def _gather_configs(self) -> tuple[DataConfig, ModelConfig, TrainConfig]:
         data_cfg = DataConfig(
             m5_path=self._csv_path.text().strip(),
+            base_tf_minutes=self._base_tf.value(),
             stf_factor=self._stf_min.value(),
             lookback=self._lookback.value(),
             rolling_window_size=self._rolling_window.value(),
             hurst_window=self._hurst_window.value(),
             regime_n_clusters=self._regime_clusters.value(),
-            macd_fast=self._macd_fast.value(),
-            macd_slow=self._macd_slow.value(),
-            macd_signal=self._macd_signal.value(),
+            ma_min=self._ma_min.value(),
+            ma_max=self._ma_max.value(),
+            ma_count=self._ma_count.value(),
+            signal_ma_count=self._signal_ma_count.value(),
+            strategy=self._strategy_combo.currentData(),
+            mafilter_nh=self._mf_nh.value(),
+            mafilter_fac_slope=self._mf_fac_slope.value(),
+            mafilter_fslope_thresh=self._mf_fslope_thresh.value(),
+            mafilter_max_bw_factor=self._mf_max_bw_factor.value(),
+            mafilter_stddev_factor=self._mf_stddev_factor.value(),
+            mafilter_exit_option=self._mf_exit_option.currentData(),
             active_feature_groups=self._get_active_feature_groups(),
+            spread=self._spread_spin.value(),
+            slippage=self._slippage_spin.value(),
+            point=self._point_spin.value(),
+            tick_value=self._tick_value_spin.value(),
         )
         model_cfg = ModelConfig(
             hidden_size=self._hidden.value(),
@@ -468,9 +638,14 @@ class NTCPMainWindow(QMainWindow):
         self._stop_btn.setEnabled(True)
         self._progress.setValue(0)
 
+        # Clear monitor plot
+        self._actual_curve.setData([])
+        self._pred_curve.setData([])
+
         self._training_worker = TrainingWorker(data_cfg, model_cfg, train_cfg)
         self._training_worker.log_signal.connect(self._log.log)
         self._training_worker.progress_signal.connect(self._on_train_progress)
+        self._training_worker.sample_signal.connect(self._on_train_sample)
         self._training_worker.finished_signal.connect(self._on_train_finished)
         self._training_worker.start()
         self._log.log("Training started.")
@@ -480,9 +655,61 @@ class NTCPMainWindow(QMainWindow):
             self._training_worker.request_stop()
             self._log.log("Stop requested...")
 
+    def _clear_all(self) -> None:
+        """Reset all results, graphs, tables, and logs."""
+        self._training_results.clear()
+        self._current_result = None
+        self._val_dataset = None
+        self._last_dm = None
+
+        # Monitor plot
+        self._actual_curve.setData([])
+        self._pred_curve.setData([])
+        self._monitor_plot.setTitle("Pred vs Actual", color="#888888")
+
+        # Progress
+        self._progress.setValue(0)
+
+        # Backtest tab
+        self._factor_combo.clear()
+        self._equity_widget.set_data(None)
+        self._metrics_table._table.setRowCount(0)
+        self._target_check_table.setRowCount(0)
+
+        # Log
+        self._log.clear()
+        self._log.log("Cleared all results.")
+
     def _on_train_progress(self, epoch: int, total: int) -> None:
         pct = int(epoch / max(total, 1) * 100)
         self._progress.setValue(pct)
+
+    def _on_train_sample(self, epoch, reg_actuals, reg_preds, cls_actuals, cls_probs) -> None:
+        """Update live monitor plot — confidence plot or regression plot."""
+        strategy = self._strategy_combo.currentData()
+
+        if strategy == "mafilter":
+            # Confidence plot: long signal probability vs actual label
+            probs = cls_probs[:, 0]  # long confidence
+            labels = cls_actuals[:, 0]  # long actual
+            idx = np.argsort(probs)
+            self._pred_curve.setData(probs[idx])
+            self._actual_curve.setData(labels[idx])
+            self._monitor_plot.setTitle(
+                f"Cls Confidence — Long Signal (Epoch {epoch})", color="#888888",
+            )
+            self._monitor_plot.setLabel("left", "Probability")
+            self._monitor_plot.setLabel("bottom", "Sample (sorted by confidence)")
+        else:
+            # Regression: MFE 10-bar pred vs actual
+            idx = np.argsort(reg_actuals)
+            self._actual_curve.setData(reg_actuals[idx])
+            self._pred_curve.setData(reg_preds[idx])
+            self._monitor_plot.setTitle(
+                f"Pred vs Actual — MFE 10-bar (Epoch {epoch})", color="#888888",
+            )
+            self._monitor_plot.setLabel("left", "Value (x100)")
+            self._monitor_plot.setLabel("bottom", "Sample (sorted by actual)")
 
     def _on_train_finished(self, results: list) -> None:
         self._start_btn.setEnabled(True)
@@ -521,12 +748,33 @@ class NTCPMainWindow(QMainWindow):
         self._factor_combo = QComboBox()
         ctrl.addWidget(self._factor_combo)
 
+        self._crv_label = QLabel("CRV Threshold:")
         self._crv_spin = QDoubleSpinBox()
         self._crv_spin.setRange(0.5, 10.0)
         self._crv_spin.setDecimals(2)
-        self._crv_spin.setValue(1.5)
-        ctrl.addWidget(QLabel("CRV Threshold:"))
+        self._crv_spin.setValue(1.0)
+        ctrl.addWidget(self._crv_label)
         ctrl.addWidget(self._crv_spin)
+
+        self._cls_thresh_label = QLabel("Cls Confidence:")
+        self._cls_thresh_spin = QDoubleSpinBox()
+        self._cls_thresh_spin.setRange(0.0, 1.0)
+        self._cls_thresh_spin.setDecimals(2)
+        self._cls_thresh_spin.setSingleStep(0.05)
+        self._cls_thresh_spin.setValue(0.50)
+        ctrl.addWidget(self._cls_thresh_label)
+        ctrl.addWidget(self._cls_thresh_spin)
+
+        ctrl.addWidget(QLabel("Lot Size:"))
+        self._lot_size_spin = QDoubleSpinBox()
+        self._lot_size_spin.setRange(0.01, 100.0)
+        self._lot_size_spin.setDecimals(2)
+        self._lot_size_spin.setSingleStep(0.01)
+        self._lot_size_spin.setValue(0.10)
+        ctrl.addWidget(self._lot_size_spin)
+
+        self._show_dollar_check = QCheckBox("Show in $")
+        ctrl.addWidget(self._show_dollar_check)
 
         self._bt_btn = QPushButton("Run Backtest")
         self._bt_btn.clicked.connect(self._run_backtest)
@@ -584,14 +832,25 @@ class NTCPMainWindow(QMainWindow):
         try:
             dm = NTCPDataManager(data_cfg)
             dataset = dm.run_pipeline(log_callback=lambda m: self._log.log(m))
+            self._last_dm = dm
             n = len(dataset)
             val_size = int(n * self._val_slider.value() / 100.0)
             train_size = n - val_size
+            lookback = data_cfg.lookback
 
             # Extract validation portion
             val_feats = dataset.features[train_size:].numpy()
             val_tgts = dataset.targets[train_size:].numpy()
-            val_ds = NTCPDataset(val_feats, val_tgts, lookback=data_cfg.lookback)
+            val_cls_tgts = dataset.cls_targets[train_size:].numpy()
+            val_ds = NTCPDataset(val_feats, val_tgts, lookback=lookback,
+                                 cls_targets=val_cls_tgts)
+
+            # Entry prices aligned to validation samples
+            val_entry_prices = None
+            if dm.raw_closes is not None:
+                val_entry_prices = dm.raw_closes[
+                    train_size + lookback - 1 : train_size + val_size + lookback - 1
+                ]
 
             model_cfg = ModelConfig(
                 input_size=result.num_features,
@@ -601,13 +860,24 @@ class NTCPMainWindow(QMainWindow):
                 cell_type="GRU" if self._gru_radio.isChecked() else "LSTM",
             )
 
+            show_dollars = self._show_dollar_check.isChecked()
             self._backtest_worker = BacktestWorker(
                 model_state=result.model_state,
                 model_cfg=model_cfg,
                 dataset=val_ds,
                 target_cols=result.target_cols,
-                crv_threshold=self._crv_spin.value(),
+                crv_threshold=(self._cls_thresh_spin.value()
+                              if self._strategy_combo.currentData() == "mafilter"
+                              else self._crv_spin.value()),
                 use_cuda=self._cuda_check.isChecked(),
+                spread=self._spread_spin.value(),
+                slippage=self._slippage_spin.value(),
+                point=self._point_spin.value(),
+                tick_value=self._tick_value_spin.value(),
+                lot_size=self._lot_size_spin.value(),
+                show_in_dollars=show_dollars,
+                entry_prices=val_entry_prices,
+                strategy=self._strategy_combo.currentData(),
             )
             self._backtest_worker.log_signal.connect(self._log.log)
             self._backtest_worker.finished_signal.connect(self._on_backtest_finished)
@@ -620,13 +890,31 @@ class NTCPMainWindow(QMainWindow):
         if metrics is None:
             return
 
+        # Update equity chart label
+        if metrics.show_in_dollars:
+            self._equity_widget.set_y_label("Equity ($)")
+        else:
+            self._equity_widget.set_y_label("Equity")
+
         self._equity_widget.set_data(metrics.equity_curve.tolist())
+
+        def _fmt(val: float) -> str:
+            if metrics.show_in_dollars:
+                return f"${val:,.2f}"
+            return f"{val:.6f}"
 
         display = {
             "Total Trades": str(metrics.total_trades),
+            "Long Trades": str(metrics.long_trades),
+            "Short Trades": str(metrics.short_trades),
+            "Winners": str(metrics.num_winners),
+            "Losers": str(metrics.num_losers),
+            "Avg Winner": _fmt(metrics.avg_winner),
+            "Avg Loser": _fmt(metrics.avg_loser),
             "Win Rate": f"{metrics.win_rate*100:.1f}%",
             "Profit Factor": f"{metrics.profit_factor:.3f}",
-            "Max Drawdown": f"{metrics.max_drawdown:.6f}",
+            "Total PnL": _fmt(metrics.total_pnl),
+            "Max Drawdown": _fmt(metrics.max_drawdown),
         }
         # Add per-target R^2
         for name, val in metrics.per_target_r2.items():

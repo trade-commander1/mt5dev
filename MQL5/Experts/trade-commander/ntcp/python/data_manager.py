@@ -22,15 +22,15 @@ from torch.utils.data import Dataset
 from .config import (
     MA_SPECTRUM,
     TARGET_HORIZONS,
+    TARGET_SCALE_FACTOR,
     TICK_SMA_PERIOD,
     EPSILON,
     RSI_PERIOD,
     ATR_PERIOD,
-    DAY_BARS,
     DataConfig,
     generate_ma_spectrum,
 )
-from .strategies import TrendcatcherStrategy
+from .strategies import get_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +74,14 @@ ALL_FEATURE_GROUPS = list(FEATURE_GROUP_MAP.keys())
 # ---------------------------------------------------------------------------
 
 class NTCPDataset(Dataset):
-    """Sliding-window dataset returning (feature_sequence, target_vector) pairs."""
+    """Sliding-window dataset returning (feature_sequence, reg_target, cls_target) triples."""
 
     def __init__(
         self,
         features: np.ndarray,
         targets: np.ndarray,
         lookback: int,
+        cls_targets: np.ndarray | None = None,
     ) -> None:
         assert features.shape[0] == targets.shape[0], "Feature/target length mismatch"
         assert lookback < features.shape[0], "Lookback exceeds available data"
@@ -90,13 +91,20 @@ class NTCPDataset(Dataset):
         self.lookback = lookback
         self._length = features.shape[0] - lookback
 
+        if cls_targets is not None:
+            assert cls_targets.shape[0] == features.shape[0], "Cls target length mismatch"
+            self.cls_targets = torch.as_tensor(cls_targets, dtype=torch.float32)
+        else:
+            self.cls_targets = torch.zeros(features.shape[0], 2, dtype=torch.float32)
+
     def __len__(self) -> int:
         return self._length
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         seq = self.features[idx : idx + self.lookback]
         tgt = self.targets[idx + self.lookback - 1]
-        return seq, tgt
+        cls_tgt = self.cls_targets[idx + self.lookback - 1]
+        return seq, tgt, cls_tgt
 
 
 # ---------------------------------------------------------------------------
@@ -458,9 +466,13 @@ class NTCPDataManager:
         self.target_matrix: Optional[np.ndarray] = None
         self.feature_cols: list[str] = []
         self.target_cols: list[str] = []
+        self.cls_target_cols: list[str] = []
         self.scaling_params: dict = {}
         self.ma_spectrum: list[int] = []
         self._m5_fastest_ma: Optional[np.ndarray] = None
+        self._m5_raw_ma_values: Optional[np.ndarray] = None
+        self._m5_raw_stddev_values: Optional[np.ndarray] = None
+        self.raw_closes: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # CSV Loading
@@ -468,19 +480,52 @@ class NTCPDataManager:
 
     @staticmethod
     def _load_csv(path: Path) -> pd.DataFrame:
-        """Load an MT5 CSV export (tab-separated) and parse timestamps."""
-        df = pd.read_csv(path, sep="\t")
+        """Load an MT5 CSV export (comma or tab-separated) and parse timestamps."""
+        # Auto-detect separator
+        with open(path, "r", encoding="utf-8") as f:
+            first_line = f.readline()
+        sep = "\t" if "\t" in first_line else ","
+
+        df = pd.read_csv(path, sep=sep)
+        # Normalize column names: strip angle brackets, whitespace, lowercase
         df.columns = [
             c.replace("<", "").replace(">", "").strip().lower()
             for c in df.columns
         ]
-        df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"])
-        df = df.drop(columns=["date", "time"])
+
+        # Parse datetime — handle single 'datetime' or separate 'date'+'time'
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"])
+        elif "date" in df.columns and "time" in df.columns:
+            df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"])
+            df = df.drop(columns=["date", "time"])
+        elif "date" in df.columns:
+            df["datetime"] = pd.to_datetime(df["date"])
+            df = df.drop(columns=["date"])
+
         df = df.rename(columns={
             "tickvol": "tick_volume",
+            "tickvolume": "tick_volume",
             "vol": "volume",
             "spread": "spread",
         })
+
+        # Derive OHLC from Bid/Ask when OHLC columns are absent
+        if "open" not in df.columns and "bid" in df.columns:
+            ask = df["ask"] if "ask" in df.columns else df["bid"]
+            mid = (df["bid"] + ask) / 2.0
+            df["open"] = mid
+            df["high"] = df[["bid", "ask"]].max(axis=1) if "ask" in df.columns else mid
+            df["low"] = df[["bid", "ask"]].min(axis=1) if "ask" in df.columns else mid
+            df["close"] = mid
+            df = df.drop(columns=[c for c in ["bid", "ask"] if c in df.columns])
+
+        # Ensure tick_volume exists
+        if "tick_volume" not in df.columns and "volume" in df.columns:
+            df = df.rename(columns={"volume": "tick_volume"})
+        if "tick_volume" not in df.columns:
+            df["tick_volume"] = 0.0
+
         df = df.sort_values("datetime").reset_index(drop=True)
         return df
 
@@ -532,6 +577,8 @@ class NTCPDataManager:
         # Derive dynamic MA spectrum
         ma_spectrum = self.cfg.get_ma_spectrum()
         self.ma_spectrum = ma_spectrum
+        self.scaling_params["ma_spectrum"] = ma_spectrum
+        self.scaling_params["signal_ma_count"] = self.cfg.signal_ma_count
         fastest_period = ma_spectrum[0]
 
         opens = df["open"].values.astype(np.float64)
@@ -584,14 +631,20 @@ class NTCPDataManager:
         # Array to collect fastest MA values for strategy exit computation
         m5_fastest_ma = np.zeros(n, dtype=np.float64)
 
+        # Raw MA and StdDev arrays for strategy use (n, num_mas)
+        num_mas = len(ma_spectrum)
+        m5_raw_ma_values = np.zeros((n, num_mas), dtype=np.float64)
+        m5_raw_stddev_values = np.zeros((n, num_mas), dtype=np.float64)
+
         # Rolling daily high/low tracking
-        day_highs = np.full(DAY_BARS, np.nan)
-        day_lows = np.full(DAY_BARS, np.nan)
+        day_bars = 1440 // self.cfg.base_tf_minutes
+        day_highs = np.full(day_bars, np.nan)
+        day_lows = np.full(day_bars, np.nan)
         day_idx = 0
 
-        # Track previous MA values for slope computation
-        prev_m5_ma_values: dict[int, float] = {p: 0.0 for p in ma_spectrum}
-        prev_stf_ma_values: dict[int, float] = {p: 0.0 for p in ma_spectrum}
+        # Track previous MA values for slope computation (empty → first slope = 0)
+        prev_m5_ma_values: dict[int, float] = {}
+        prev_stf_ma_values: dict[int, float] = {}
 
         log_step = max(1, n // 20)
 
@@ -607,6 +660,11 @@ class NTCPDataManager:
 
             # Collect fastest MA value
             m5_fastest_ma[i] = m5_bank.ma_indicators[fastest_period].ma
+
+            # Collect raw MA and StdDev values for all periods
+            for k_idx, p in enumerate(ma_spectrum):
+                m5_raw_ma_values[i, k_idx] = m5_bank.ma_indicators[p].ma
+                m5_raw_stddev_values[i, k_idx] = m5_bank.ma_indicators[p].std_dev
 
             # --- Build developing STF bar ---
             group_idx = i // stf_factor
@@ -652,10 +710,10 @@ class NTCPDataManager:
             row.append((ma_fast_val - ma_slow_val) / (c + EPSILON))
 
             # Daily high/low distance
-            day_highs[day_idx % DAY_BARS] = h
-            day_lows[day_idx % DAY_BARS] = l
+            day_highs[day_idx % day_bars] = h
+            day_lows[day_idx % day_bars] = l
             day_idx += 1
-            valid_count = min(day_idx, DAY_BARS)
+            valid_count = min(day_idx, day_bars)
             rolling_high = np.nanmax(day_highs[:valid_count])
             rolling_low = np.nanmin(day_lows[:valid_count])
             row.append((rolling_high / c) - 1.0)
@@ -704,45 +762,62 @@ class NTCPDataManager:
                 pct = (i + 1) / n * 100
                 log_callback(f"Building features: {pct:.0f}% ({i+1}/{n})")
 
-        # Store fastest MA for strategy use
+        # Store fastest MA and raw arrays for strategy use
         self._m5_fastest_ma = m5_fastest_ma
+        self._m5_raw_ma_values = m5_raw_ma_values
+        self._m5_raw_stddev_values = m5_raw_stddev_values
 
-        # --- Post-loop: Hurst exponent ---
-        if log_callback:
-            log_callback("Computing Hurst exponent...")
-        m5_hurst = compute_hurst_exponent(closes, self.cfg.hurst_window)
-        features[:, num_loop_features] = m5_hurst
+        # Determine which post-loop groups are active (empty = all active)
+        active_groups = self.cfg.active_feature_groups
+        _grp_active = lambda g: not active_groups or g in active_groups
 
-        # Build a synthetic STF close series for STF Hurst
-        stf_close_series = np.full(n, np.nan, dtype=np.float64)
-        for i in range(n):
-            group_start = (i // stf_factor) * stf_factor
-            stf_close_series[i] = closes[i]  # developing bar close = current M5 close
-        stf_hurst = compute_hurst_exponent(stf_close_series, self.cfg.hurst_window)
-
-        # --- Post-loop: Market Regime via GMM ---
-        if log_callback:
-            log_callback("Computing market regimes (GMM)...")
-
-        # Use M5 MA + SD columns as input for regime clustering
-        ma_col_indices = []
-        for j, name in enumerate(loop_feat_names):
-            if name.startswith("m5_ma_") or name.startswith("m5_sd_"):
-                ma_col_indices.append(j)
-        regime_input = features[:, ma_col_indices]
-        regime_one_hot, regime_centroids = compute_market_regimes(
-            regime_input, n_clusters,
-        )
-
-        # Insert post-loop columns
+        # Post-loop column layout: [m5_hurst, m5_regime_0..K, stf_hurst]
         col_offset = num_loop_features
-        features[:, col_offset] = m5_hurst        # m5_hurst
-        col_offset += 1
-        features[:, col_offset:col_offset + n_clusters] = regime_one_hot  # m5_regime_0..3
-        col_offset += n_clusters
-        features[:, col_offset] = stf_hurst        # stf_hurst
 
-        self.scaling_params["regime_centroids"] = regime_centroids.tolist()
+        # --- m5_hurst ---
+        if _grp_active("m5_hurst"):
+            if log_callback:
+                log_callback("Computing M5 Hurst exponent...")
+            features[:, col_offset] = compute_hurst_exponent(
+                closes, self.cfg.hurst_window,
+            )
+        else:
+            features[:, col_offset] = 0.0
+        col_offset += 1
+
+        # --- m5_regime ---
+        if _grp_active("m5_regime"):
+            if log_callback:
+                log_callback("Computing market regimes (GMM)...")
+            ma_col_indices = []
+            for j, name in enumerate(loop_feat_names):
+                if name.startswith("m5_ma_") or name.startswith("m5_sd_"):
+                    ma_col_indices.append(j)
+            regime_input = features[:, ma_col_indices]
+            regime_one_hot, regime_centroids = compute_market_regimes(
+                regime_input, n_clusters,
+            )
+            features[:, col_offset:col_offset + n_clusters] = regime_one_hot
+            self.scaling_params["regime_centroids"] = regime_centroids.tolist()
+        else:
+            if log_callback:
+                log_callback("Skipping market regimes (group unchecked).")
+            features[:, col_offset:col_offset + n_clusters] = 0.0
+            self.scaling_params["regime_centroids"] = np.zeros(
+                (n_clusters, 2 * len(ma_spectrum)), dtype=np.float64,
+            ).tolist()
+        col_offset += n_clusters
+
+        # --- stf_hurst ---
+        if _grp_active("stf_hurst"):
+            if log_callback:
+                log_callback("Computing STF Hurst exponent...")
+            stf_close_series = closes.copy()
+            features[:, col_offset] = compute_hurst_exponent(
+                stf_close_series, self.cfg.hurst_window,
+            )
+        else:
+            features[:, col_offset] = 0.0
 
         # --- Feature group filtering ---
         feature_group_map = build_feature_group_map(ma_spectrum, n_clusters)
@@ -804,9 +879,11 @@ class NTCPDataManager:
         low = df["low"].values.astype(np.float64)
 
         # Delegate to strategy
-        strategy = TrendcatcherStrategy(self.cfg, self.ma_spectrum)
+        strategy = get_strategy(self.cfg.strategy, self.cfg, self.ma_spectrum)
         targets, target_names = strategy.generate_targets(
             close, high, low, self._m5_fastest_ma,
+            raw_ma_values=self._m5_raw_ma_values,
+            raw_stddev_values=self._m5_raw_stddev_values,
         )
 
         # Percentile clipping (skip binary tgt_exit_* columns)
@@ -815,7 +892,7 @@ class NTCPDataManager:
         clip_bounds: dict[str, dict[str, float]] = {}
 
         for j, name in enumerate(target_names):
-            if name.startswith("tgt_exit_"):
+            if name.startswith("tgt_exit_") or name.startswith("tgt_cls_"):
                 continue
             col = targets[:, j]
             valid = col[~np.isnan(col)]
@@ -857,15 +934,45 @@ class NTCPDataManager:
         features = self.feature_matrix[start:end].astype(np.float32)
         targets = self.target_matrix[start:end].astype(np.float32)
 
+        # Store raw M5 close prices for dollar conversion in backtest
+        if self.m5_df is not None:
+            self.raw_closes = self.m5_df["close"].values[start:end].astype(np.float64)
+
+        # Strip binary exit-flag columns — model does regression only
+        keep = [i for i, name in enumerate(self.target_cols)
+                if not name.startswith("tgt_exit_")]
+        targets = targets[:, keep]
+        self.target_cols = [self.target_cols[i] for i in keep]
+
+        # Separate classification targets (binary, not scaled)
+        cls_indices = [i for i, name in enumerate(self.target_cols)
+                       if name.startswith("tgt_cls_")]
+        reg_indices = [i for i, name in enumerate(self.target_cols)
+                       if not name.startswith("tgt_cls_")]
+
+        cls_targets = targets[:, cls_indices] if cls_indices else None
+        self.cls_target_cols = [self.target_cols[i] for i in cls_indices]
+
+        targets = targets[:, reg_indices]
+        self.target_cols = [self.target_cols[i] for i in reg_indices]
+
+        # Scale regression targets for better gradient flow
+        targets *= TARGET_SCALE_FACTOR
+        self.scaling_params["target_scale_factor"] = TARGET_SCALE_FACTOR
+
         # Replace any remaining interior NaN with 0
         features = np.nan_to_num(features, nan=0.0)
         targets = np.nan_to_num(targets, nan=0.0)
+        if cls_targets is not None:
+            cls_targets = np.nan_to_num(cls_targets, nan=0.0)
 
-        dataset = NTCPDataset(features, targets, lookback=self.cfg.lookback)
+        dataset = NTCPDataset(features, targets, lookback=self.cfg.lookback,
+                              cls_targets=cls_targets)
         logger.info(
-            "Dataset ready: %d samples, lookback=%d, %d features, %d targets.",
+            "Dataset ready: %d samples, lookback=%d, %d features, %d reg targets, %d cls targets.",
             len(dataset), self.cfg.lookback,
             features.shape[1], targets.shape[1],
+            cls_targets.shape[1] if cls_targets is not None else 0,
         )
         return dataset
 

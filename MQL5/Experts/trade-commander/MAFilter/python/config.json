@@ -1,0 +1,62 @@
+{
+  "version": "1.0",
+  "window": {
+    "width": 860,
+    "height": 1002,
+    "position_x": 902,
+    "position_y": 349
+  },
+  "data_manager": {
+    "last_data_file": "D:/trading/QuantDataManager/export/DUKASCOPY_XAUUSD_M1.csv",
+    "native_bar_period": "1M",
+    "target_bar_period": "5M",
+    "day_offset": 20,
+    "symbol_name": "",
+    "mintick": 0.01,
+    "tick_value": 1.0,
+    "default_lots": 0.1
+  },
+  "backtest_train": {
+    "ea_parameters": {
+      "lot_size": 0.1,
+      "min_len": 5,
+      "max_len": 15,
+      "nbr_ma": 4,
+      "min_slope_factor": 1.0,
+      "min_laminar_level": 0.75,
+      "max_bandwidth_factor": 1.0,
+      "nh": 1000,
+      "std_dev_factor": 1.0,
+      "exit_option": 0,
+      "magic_number": 20260209
+    },
+    "training": {
+      "good_threshold": 0.0,
+      "epochs": 100,
+      "batch_size": 64,
+      "patience": 15
+    },
+    "nn_config": {
+      "nn_type": "Dense (Feedforward)",
+      "architecture": "Medium",
+      "custom_arch": false,
+      "custom_layers": 3,
+      "custom_sizes": "256,128,64",
+      "dropout": 0.2,
+      "use_dropout": true
+    },
+    "lookback_config": {
+      "enabled": true,
+      "length": 50,
+      "include_ohlcv": true,
+      "include_laminar": false,
+      "include_bw": false,
+      "include_stddev": false,
+      "include_slopes": false,
+      "normalization": "Dynamic (per window)"
+    },
+    "output_dir": "",
+    "device": "CPU"
+  },
+  "last_saved": "2026-02-11T15:56:14.710618"
+}

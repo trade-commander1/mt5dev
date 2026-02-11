@@ -104,6 +104,9 @@ class EquityCurveWidget(QWidget):
         self._plot.setLabel("bottom", "Trade #")
         layout.addWidget(self._plot)
 
+    def set_y_label(self, label: str) -> None:
+        self._plot.setLabel("left", label)
+
     def set_data(self, equity: list[float] | None) -> None:
         self._plot.clear()
         if equity and len(equity) > 1:

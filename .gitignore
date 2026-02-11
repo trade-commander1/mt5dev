@@ -8,6 +8,7 @@ history/
 *.his
 
 # Ignorierte Ordner
+logs/
 MQL5/Logs/
 MQL5/Services/
 

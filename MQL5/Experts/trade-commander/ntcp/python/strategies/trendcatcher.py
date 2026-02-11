@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..config import TARGET_HORIZONS, DataConfig
+from ..config import TARGET_HORIZONS, CLS_CRV_THRESHOLD, EPSILON, DataConfig
 
 
 class TrendcatcherStrategy:
@@ -58,6 +58,7 @@ class TrendcatcherStrategy:
         highs: np.ndarray,
         lows: np.ndarray,
         ma_fastest: np.ndarray,
+        **kwargs,
     ) -> tuple[np.ndarray, list[str]]:
         """
         Generate exit-aware targets for all horizons.
@@ -109,5 +110,31 @@ class TrendcatcherStrategy:
             targets[:, col_idx + 2] = mom
             targets[:, col_idx + 3] = exit_flag
             col_idx += 4
+
+        # Classification labels from 3-bar horizon
+        mfe_3 = targets[:, 0]  # tgt_mfe_3
+        mae_3 = targets[:, 1]  # tgt_mae_3
+        mom_3 = targets[:, 2]  # tgt_mom_3
+
+        abs_mae_3 = np.abs(mae_3)
+        cls_long = np.zeros(n, dtype=np.float64)
+        cls_short = np.zeros(n, dtype=np.float64)
+
+        for i in range(n):
+            if np.isnan(mfe_3[i]) or np.isnan(mae_3[i]) or np.isnan(mom_3[i]):
+                cls_long[i] = np.nan
+                cls_short[i] = np.nan
+                continue
+            # Long: upside reward ratio good AND positive momentum
+            if abs_mae_3[i] > EPSILON and mfe_3[i] / abs_mae_3[i] >= CLS_CRV_THRESHOLD and mom_3[i] > 0:
+                cls_long[i] = 1.0
+            # Short: downside reward ratio good AND negative momentum
+            if mfe_3[i] > EPSILON and abs_mae_3[i] / mfe_3[i] >= CLS_CRV_THRESHOLD and mom_3[i] < 0:
+                cls_short[i] = 1.0
+
+        # Append cls columns
+        cls_cols = np.column_stack([cls_long, cls_short])
+        targets = np.concatenate([targets, cls_cols], axis=1)
+        target_names.extend(["tgt_cls_long", "tgt_cls_short"])
 
         return targets, target_names

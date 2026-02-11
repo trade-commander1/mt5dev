@@ -13,6 +13,7 @@ import torch
 
 from .config import (
     MA_SPECTRUM,
+    NUM_CLS_TARGETS,
     TARGET_HORIZONS,
     TICK_SMA_PERIOD,
     ExportConfig,
@@ -52,10 +53,11 @@ class NTCPExporter:
             dummy,
             str(onnx_path),
             input_names=["input"],
-            output_names=["output"],
+            output_names=["regression", "classification"],
             dynamic_axes={
                 "input": {0: "batch_size"},
-                "output": {0: "batch_size"},
+                "regression": {0: "batch_size"},
+                "classification": {0: "batch_size"},
             },
             opset_version=17,
         )
@@ -94,13 +96,19 @@ class NTCPExporter:
         lines.append(f"#define NTCP_LOOKBACK {lookback}")
         lines.append(f"#define NTCP_NUM_FEATURES {len(feature_cols)}")
         lines.append(f"#define NTCP_NUM_TARGETS {len(target_cols)}")
+        lines.append(f"#define NTCP_NUM_CLS_TARGETS {NUM_CLS_TARGETS}")
         lines.append(f"#define NTCP_TICK_SMA_PERIOD {TICK_SMA_PERIOD}")
+        scale = scaling_params.get("target_scale_factor", 1.0)
+        lines.append(f"#define NTCP_TARGET_SCALE_FACTOR {scale:.1f}")
         lines.append("")
 
-        # MA spectrum
-        ma_str = ", ".join(str(p) for p in MA_SPECTRUM)
+        # MA spectrum (dynamic from training)
+        ma_spectrum = scaling_params.get("ma_spectrum", MA_SPECTRUM)
+        signal_n = scaling_params.get("signal_ma_count", 4)
+        ma_str = ", ".join(str(p) for p in ma_spectrum)
         lines.append(f"const int NTCP_MA_SPECTRUM[] = {{{ma_str}}};")
-        lines.append(f"#define NTCP_MA_COUNT {len(MA_SPECTRUM)}")
+        lines.append(f"#define NTCP_MA_COUNT {len(ma_spectrum)}")
+        lines.append(f"#define NTCP_SIGNAL_MA_COUNT {signal_n}")
         lines.append("")
 
         # Target horizons
