@@ -1,10 +1,12 @@
 {
-  "version": "1.0",
+  "version": "3.0000",
+  "version_major": 3,
+  "version_minor": 0,
   "window": {
-    "width": 860,
-    "height": 1002,
-    "position_x": 3020,
-    "position_y": 321
+    "width": 946,
+    "height": 1200,
+    "position_x": 2580,
+    "position_y": 204
   },
   "data_manager": {
     "last_data_file": "D:/trading/QuantDataManager/export/DUKASCOPY_XAUUSD_M1.csv",
@@ -38,25 +40,25 @@
     },
     "nn_config": {
       "nn_type": "Dense (Feedforward)",
-      "architecture": "Medium",
+      "architecture": "Large",
       "custom_arch": false,
-      "custom_layers": 3,
+      "custom_layers": 10,
       "custom_sizes": "256,128,64",
       "dropout": 0.2,
       "use_dropout": true
     },
     "lookback_config": {
       "enabled": true,
-      "length": 50,
+      "length": 152,
       "include_ohlcv": true,
-      "include_laminar": false,
-      "include_bw": false,
-      "include_stddev": false,
-      "include_slopes": false,
+      "include_laminar": true,
+      "include_bw": true,
+      "include_stddev": true,
+      "include_slopes": true,
       "normalization": "Dynamic (per window)"
     },
-    "output_dir": "",
-    "device": "CPU"
+    "output_dir": "D:\\trading\\mt5dev\\MQL5\\Experts\\trade-commander\\MAFilter\\python\\models",
+    "device": "CUDA:0 (NVIDIA GeForce RTX 5080)"
   },
-  "last_saved": "2026-02-11T17:07:46.354599"
+  "last_saved": "2026-02-11T19:13:54.800585"
 }

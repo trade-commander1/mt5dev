@@ -22,9 +22,10 @@ class TraceWidget(QPlainTextEdit):
         self.setMinimumHeight(120)
         self._colors = {
             "warning": QColor("#ffa500"),   # Orange
-            "error": QColor("#ff0000"),    # Red
-            "result": QColor("#00ffff"),   # Cyan
-            "info": QColor("#ffffff"),     # White
+            "error": QColor("#ff0000"),     # Red
+            "result": QColor("#00ffff"),    # Cyan
+            "info": QColor("#ffffff"),      # White
+            "positive": QColor("#00ff00"), # Green (positive/profitable)
         }
 
     def append_with_level(self, level: str, message: str) -> None:

@@ -17,9 +17,16 @@ def get_config_path() -> Path:
     return Path(__file__).resolve().parent / CONFIG_FILENAME
 
 
+APP_VERSION = "3.0000"
+APP_VERSION_MAJOR = 3
+APP_VERSION_MINOR = 0
+
+
 def get_default_config() -> dict[str, Any]:
     return {
-        "version": "1.0",
+        "version": APP_VERSION,
+        "version_major": APP_VERSION_MAJOR,
+        "version_minor": APP_VERSION_MINOR,
         "window": {"width": 860, "height": 1002, "position_x": 100, "position_y": 100},
         "data_manager": {
             "last_data_file": "",

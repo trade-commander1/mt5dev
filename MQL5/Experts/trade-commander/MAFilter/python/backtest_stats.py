@@ -111,6 +111,7 @@ def compute_backtest_metrics(
         n = n_trades
         z_score = (w - 0.5 * n) / math.sqrt(0.25 * n) if n > 0 else 0.0
 
+    # Max DD: (Lowest Equity - Peak Equity) / Peak Equity × 100% (stored as negative)
     equity_curve = compute_equity_curve(trades, n_bars)
     peak = equity_curve[0]
     max_dd_abs = 0.0
@@ -124,6 +125,7 @@ def compute_backtest_metrics(
         dd_pct = (dd_abs / peak * 100.0) if peak > 0 else 0.0
         if dd_pct > max_dd_pct:
             max_dd_pct = dd_pct
+    max_dd_pct = -max_dd_pct  # store as negative (drawdown = loss)
 
     return {
         "total_loss": total_loss_abs,

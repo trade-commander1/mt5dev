@@ -208,13 +208,13 @@ public:
         }
         if (historicalSlope != NULL)
         {
-            historicalSlope.update(slope, weight, isNewBar);
+            historicalSlope.update(MathAbs(slope), weight, isNewBar);
         }
 
         count++;
         return ma;
     }
-
+   
     /**
      * Resets the Moving Average and sets a new length.
      *
@@ -320,6 +320,32 @@ public:
      * @return The TC_MA_TYPE enum value.
      */
     TC_MA_TYPE GetMAType() const { return maType; }
+
+    /**
+     * Retrieves the historical average of the slope (when lengthHist > 0 in setup).
+     */
+    double GetHistoricalSlopeMA() const { return (historicalSlope != NULL) ? historicalSlope.GetMA() : 0.0; }
+
+    /**
+     * Returns the signed ratio of current slope vs historical slope.
+     * Positive when current slope exceeds historical average, negative otherwise.
+     * Returns 0 if historical slope is zero or unavailable.
+     */
+    double SlopeLevel() const
+    {
+        double histSlope = GetHistoricalSlopeMA();
+        if (histSlope == 0.0) return 0.0;
+        return GetSlope() / MathAbs(histSlope);
+    }
+    
+    /**
+     * Dump slope.
+     */
+    void DumpSlope(void)
+    {
+       PrintFormat("slope=%.4f hist-slope=%.4f",slope,historicalSlope.GetMA());
+    }    
+    
 };
 
 //+------------------------------------------------------------------+
@@ -334,9 +360,10 @@ class tcMABundle
 private:
     int nbrMA;
     tcMA* maArray[];
-    tcMA* historicalBandwidth; // Instance to track historical bandwidth
-    TC_MA_TYPE maType;         // Moving average type for the bundle
-
+    tcMA* historicalBandwidth;   // Instance to track historical bandwidth
+    TC_MA_TYPE maType;           // Moving average type for the bundle
+    double bw;                   // Latest bandwidth
+    double bwHist;               // Latest historical bandwidth    
 protected:
     /**
      * Cleans up and deletes all MAs.
@@ -358,7 +385,7 @@ protected:
     }
 
 public:
-    tcMABundle() : nbrMA(0), maType(TC_MA_SMA), historicalBandwidth(NULL) {}
+    tcMABundle() : nbrMA(0), maType(TC_MA_SMA), historicalBandwidth(NULL),bw(0.0),bwHist(0.0) {}
 
     virtual ~tcMABundle()
     {
@@ -366,15 +393,41 @@ public:
     }
 
     /**
-     * Sets up the tcMABundle with a specified number of MAs and their lengths.
+     * Sets up the tcMABundle with custom period lengths.
      *
-     * @param NbrMA The number of MAs to create.
-     * @param MinLen The minimum length of the MAs.
-     * @param MaxLen The maximum length of the MAs.
+     * @param periods Array of MA period lengths.
+     * @param count Number of MAs (size of periods array).
      * @param HistLen The length for the historical MA, stddev, and slope tcMA (default is 1000).
      * @param type The moving average type (SMA, EMA, DEMA, TEMA). Default is SMA.
      */
-    void setup(int NbrMA, int MinLen, int MaxLen, int HistLen = 1000, TC_MA_TYPE type = TC_MA_SMA)
+    void setup(const int &periods[], int count, int HistLen = 1000, TC_MA_TYPE type = TC_MA_SMA)
+    {
+        cleanup();
+
+        maType = type;
+        nbrMA = count;
+        ArrayResize(maArray, nbrMA);
+
+        for (int i = 0; i < nbrMA; ++i)
+        {
+            maArray[i] = new tcMA();
+            maArray[i].setup(periods[i], HistLen, type);
+        }
+
+        historicalBandwidth = new tcMA();
+        historicalBandwidth.setup(HistLen, 0, type);
+    }
+
+    /**
+     * Sets up the tcMABundle with a specified number of MAs and their lengths (linear spacing).
+     *
+     * @param NbrMA The number of MAs to create.
+     * @param nMinLen The minimum length of the MAs.
+     * @param nMaxLen The maximum length of the MAs.
+     * @param HistLen The length for the historical MA, stddev, and slope tcMA (default is 1000).
+     * @param type The moving average type (SMA, EMA, DEMA, TEMA). Default is SMA.
+     */
+    void setup(int NbrMA, int nMinLen, int nMaxLen, int HistLen = 1000, TC_MA_TYPE type = TC_MA_SMA)
     {
         cleanup();
 
@@ -385,7 +438,7 @@ public:
         for (int i = 0; i < nbrMA; ++i)
         {
             maArray[i] = new tcMA();
-            int length = (nbrMA == 1) ? MinLen : MinLen + i * (MaxLen - MinLen) / (nbrMA - 1);
+            int length = (nbrMA == 1) ? nMinLen : nMinLen + i * (nMaxLen - nMinLen) / (nbrMA - 1);
             maArray[i].setup(length, HistLen, type);
         }
 
@@ -408,31 +461,29 @@ public:
         }
 
         // Update the historical bandwidth with the current bandwidth
-        double bw = bandwidth();
-        historicalBandwidth.update(bw, weight, isNewBar);
+        bw = calculate_bandwidth();
+        bwHist=historicalBandwidth.update(bw, 1.0, isNewBar);
+        //PrintFormat("bw=%.4f hist-bw=%.4f",bw,bwHist);
     }
-
-    /**
-     * Retrieves the bandwidth of the MAs in the bundle.
-     *
-     * @return The difference between the highest and lowest MA values.
-     */
-    double bandwidth()
+    double bandwidth() const
     {
-        if (nbrMA == 0) return 0;
-
-        double maxMa = maArray[0].GetMA();
-        double minMa = maArray[0].GetMA();
-
-        for (int i = 1; i < nbrMA; ++i)
-        {
-            if (maArray[i].GetMA() > maxMa) maxMa = maArray[i].GetMA();
-            if (maArray[i].GetMA() < minMa) minMa = maArray[i].GetMA();
-        }
-
-        return MathAbs(maxMa - minMa);
+      return bw;
     }
-
+    double bandwidth_hist() const
+    {
+      return bwHist;
+    }
+    double bandwidth_level(int diffpoints=0,double PointValue=0.0) const
+    {
+      if(diffpoints <= 0 || PointValue <= 0.0)
+         return (bwHist > 0.0 ? bw /  bwHist : 0.0);
+      else
+      {
+         return (bw / (PointValue*diffpoints*(nbrMA-1)));
+      }
+    }
+    
+    
     /**
      * Retrieves the laminar level of the MAs in the bundle.
      *
@@ -443,10 +494,11 @@ public:
     double laminar_level(bool bstrict = false, bool dump = false) const
     {
         int xorder = 0;
-        double denom = 1.0;
+        double denom = nbrMA;
 
         if (nbrMA > 0)
         {
+        
             denom = nbrMA + (nbrMA - 1);
 
             double prev_avg = 0.0;
@@ -511,6 +563,147 @@ public:
      * @return The TC_MA_TYPE enum value.
      */
     TC_MA_TYPE GetMAType() const { return maType; }
+
+    /**
+     * Retrieves the number of MAs in the bundle.
+     */
+    int GetNbrMA() const { return nbrMA; }
+
+    /**
+     * Retrieves the MA value at the given index.
+     */
+    double GetMAValue(int i) const { return (i >= 0 && i < nbrMA && maArray[i] != NULL) ? maArray[i].GetMA() : 0.0; }
+
+    /**
+     * Retrieves the StdDev at the given index (slowest MA for exit band).
+     */
+    double GetStdDev(int i) const { return (i >= 0 && i < nbrMA && maArray[i] != NULL) ? maArray[i].GetStdDev() : 0.0; }
+
+    /**
+     * Retrieves the slope at the given index.
+     */
+    double GetSlope(int i) const { return (i >= 0 && i < nbrMA && maArray[i] != NULL) ? maArray[i].GetSlope() : 0.0; }
+
+    /**
+     * Retrieves the historical average of slope at the given index (for slope strength check).
+     */
+    double GetHistoricalSlopeMA(int i) const { return (i >= 0 && i < nbrMA && maArray[i] != NULL) ? maArray[i].GetHistoricalSlopeMA() : 0.0; }
+
+    /**
+     * Checks if the given price/input is strictly above all MAs in the bundle.
+     */
+    bool IsPriceAboveAllMAs(double price) const
+    {
+        for (int i = 0; i < nbrMA; ++i)
+            if (maArray[i] != NULL && price <= maArray[i].GetMA()) return false;
+        return nbrMA > 0;
+    }
+
+    /**
+     * Checks if the given price/input is strictly below all MAs in the bundle.
+     */
+    bool IsPriceBelowAllMAs(double price) const
+    {
+        for (int i = 0; i < nbrMA; ++i)
+            if (maArray[i] != NULL && price >= maArray[i].GetMA()) return false;
+        return nbrMA > 0;
+    }
+
+    /**
+     * Relative position of price to all mas.0=below all mas, nbrMA=above all mas
+     */
+    int RelativePricePosition(double price) const
+    {
+        int rel_pos=0;
+        for (int i = 0; i < nbrMA; ++i)
+        {
+            if (maArray[i] != NULL && price >= maArray[i].GetMA()) ++rel_pos;
+        }
+        return rel_pos;
+    }
+ 
+    /**
+     * Relative position of price to all mas.0=below all mas, nbrMA=above all mas
+     */
+    double RelativePricePositionLevel(double price) const
+    {
+        if(nbrMA >  0)
+        {
+           int rel_pos=0;
+           for (int i = 0; i < nbrMA; ++i)
+           {
+               if (maArray[i] != NULL && price >= maArray[i].GetMA()) ++rel_pos;
+           }
+           return (double) rel_pos / (double) nbrMA;
+        }
+        return 0.0;
+    }
+
+    /**
+     * Returns Close-MA level from -1 to 1.
+     * 1 = value above all MAs, -1 = value below all MAs, else interpolated.
+     */
+    double CloseMALevel(double value) const
+    {
+        if (nbrMA == 0) return 0.0;
+        bool aboveAll = IsPriceAboveAllMAs(value);
+        bool belowAll = IsPriceBelowAllMAs(value);
+        if (aboveAll) return 1.0;
+        if (belowAll) return -1.0;        
+        // Count how many MAs value is above; interpolate
+        int above = 0;
+        for (int i = 0; i < nbrMA; ++i)
+            if (maArray[i] != NULL && value > maArray[i].GetMA()) above++;
+        return 2.0 * (above / (double)nbrMA) - 1.0;
+    }
+
+    /**
+     * Returns the average of all individual tcMA SlopeLevel values.
+     */
+    double SlopeLevel() const
+    {
+        if (nbrMA == 0) return 0.0;
+        double sum = 0.0;
+        for (int i = 0; i < nbrMA; ++i)
+        {
+            if (maArray[i] != NULL) sum += maArray[i].SlopeLevel();
+        }
+        return sum / nbrMA;
+    }
+    
+    /**
+     * Dump slope.
+     */
+    void DumpSlopeAndBWL(void)
+    {
+      for (int i = 0; i < nbrMA; ++i)
+          maArray[i].DumpSlope();
+          
+      PrintFormat("bw=%.4f hist-bw=%.4f",bw,bwHist);
+    }    
+    
+protected:
+    /**
+     * Retrieves the bandwidth of the MAs in the bundle.
+     *
+     * @return The difference between the highest and lowest MA values.
+     */
+    double calculate_bandwidth()
+    {
+        if (nbrMA == 0) return 0;
+
+        double maxMa = maArray[0].GetMA();
+        double minMa = maArray[0].GetMA();
+
+        for (int i = 1; i < nbrMA; ++i)
+        {
+            if (maArray[i].GetMA() > maxMa) maxMa = maArray[i].GetMA();
+            if (maArray[i].GetMA() < minMa) minMa = maArray[i].GetMA();
+        }
+
+        return MathAbs(maxMa - minMa);
+    }
+    
 };
 
 //+------------------------------------------------------------------+

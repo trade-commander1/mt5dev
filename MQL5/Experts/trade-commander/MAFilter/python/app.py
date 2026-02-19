@@ -28,15 +28,17 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QDoubleSpinBox,
     QComboBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont
 
-from .app_config import get_config_path, load_config, save_config, get_default_config
+from .app_config import get_config_path, load_config, save_config, get_default_config, APP_VERSION
 from .backtest_stats import compute_backtest_metrics, compute_equity_curve
 from .csv_loader import (
     load_ohlcv_csv,
@@ -125,6 +127,7 @@ class Worker(QObject):
         batch_size: int,
         patience: int,
         out_dir: Optional[str],
+        model_basename: Optional[str] = None,
         data_tf_str: str = "1M",
         system_tf_str: str = "1M",
         day_offset: int = 20,
@@ -134,6 +137,7 @@ class Worker(QObject):
         dropout: float = 0.2,
         use_dropout: bool = True,
         device: str = "CPU",
+        do_training: bool = True,
     ) -> None:
         super().__init__()
         self.csv_path = csv_path
@@ -144,6 +148,7 @@ class Worker(QObject):
         self.batch_size = batch_size
         self.patience = patience
         self.out_dir = out_dir
+        self.model_basename = model_basename
         self.data_tf_str = data_tf_str
         self.system_tf_str = system_tf_str
         self.day_offset = day_offset
@@ -153,6 +158,7 @@ class Worker(QObject):
         self.dropout = dropout
         self.use_dropout = use_dropout
         self.device = device
+        self.do_training = do_training
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -274,7 +280,31 @@ class Worker(QObject):
                     f"(Training bars: {train_bars}, required for strategy: {bars_needed})"
                 )
                 return
+            if not self.do_training:
+                self.progress.emit(100, "Backtest done.")
+                first_ts = df_train["DateTime"].iloc[0]
+                last_ts = df["DateTime"].iloc[-1]
+                self.finished.emit({
+                    "n_bars": len(df_train),
+                    "n_trades": len(trades),
+                    "n_good": sum(1 for t in trades if t.profit > self.good_threshold),
+                    "net_profit": sum(t.profit for t in trades if t.profit > 0) - abs(sum(t.profit for t in trades if t.profit <= 0)),
+                    "net_loss": abs(sum(t.profit for t in trades if t.profit <= 0)),
+                    "trades": trades,
+                    "model": None,
+                    "scaling": None,
+                    "out_dir": self.out_dir,
+                    "first_date": str(first_ts),
+                    "split_date": str(_split_ts),
+                    "last_date": str(last_ts),
+                })
+                return
             self.progress.emit(50, "Training filter...")
+            self.trace.emit(
+                "info",
+                f"Training NN started: epochs={self.epochs}, batch_size={self.batch_size}, "
+                f"device={self.device}, out_dir={self.out_dir or 'none'}",
+            )
 
             def progress_cb(epoch: int, total: int) -> None:
                 p = 50 + int(50 * epoch / total) if total else 50
@@ -287,6 +317,7 @@ class Worker(QObject):
                 batch_size=self.batch_size,
                 patience=self.patience,
                 out_dir=Path(self.out_dir) if self.out_dir else None,
+                model_basename=self.model_basename,
                 stop_callback=stop_cb,
                 progress_callback=progress_cb,
                 nn_type=self.nn_type,
@@ -313,6 +344,7 @@ class Worker(QObject):
                 "net_profit": net_profit_sum,
                 "net_loss": net_loss_abs,
                 "trades": trades,
+                "model": model,
                 "scaling": scaling,
                 "out_dir": self.out_dir,
                 "first_date": str(first_ts),
@@ -326,13 +358,111 @@ class Worker(QObject):
             self.error.emit(str(e))
 
 
-class FinalBacktestWorker(QObject):
-    """Run backtest on application part with NN filter; emit equity and metrics."""
-    finished = Signal(object)  # dict with metrics + filtered_trades + equity_curve
+class TrainOnlyWorker(QObject):
+    """Run train_filter on existing backtest trades (no backtest). Enables testing multiple NN configs on same trades."""
+    finished = Signal(object)
     error = Signal(str)
     progress = Signal(int, str)
-    equity_point = Signal(int, float)
-    trace = Signal(str, str)  # level, message
+    trace = Signal(str, str)
+
+    def __init__(
+        self,
+        trades: list,
+        n_bars: int,
+        good_threshold: float,
+        epochs: int,
+        batch_size: int,
+        patience: int,
+        out_dir: Optional[str],
+        model_basename: Optional[str] = None,
+        nn_type: str = "Dense (Feedforward)",
+        architecture: str = "Medium",
+        custom_hidden_sizes: Optional[tuple[int, ...]] = None,
+        dropout: float = 0.2,
+        use_dropout: bool = True,
+        device: str = "CPU",
+    ) -> None:
+        super().__init__()
+        self.trades = trades
+        self.n_bars = n_bars
+        self.good_threshold = good_threshold
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.patience = patience
+        self.out_dir = out_dir
+        self.model_basename = model_basename
+        self.nn_type = nn_type
+        self.architecture = architecture
+        self.custom_hidden_sizes = custom_hidden_sizes
+        self.dropout = dropout
+        self.use_dropout = use_dropout
+        self.device = device
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+    def run(self) -> None:
+        try:
+            self._stop_requested = False
+            self.progress.emit(0, "Training NN...")
+            self.trace.emit(
+                "info",
+                f"Train NN (on cached backtest): epochs={self.epochs}, batch_size={self.batch_size}, "
+                f"device={self.device}, out_dir={self.out_dir or 'none'}",
+            )
+
+            def stop_cb() -> bool:
+                return self._stop_requested
+
+            def progress_cb(epoch: int, total: int) -> None:
+                if total <= 0:
+                    return
+                p = int(100 * (epoch + 1) / total)
+                self.progress.emit(min(p, 99), f"Training... Epoch {epoch + 1}/{total}")
+
+            model, scaling, _ = train_filter(
+                self.trades,
+                good_threshold=self.good_threshold,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                patience=self.patience,
+                out_dir=Path(self.out_dir) if self.out_dir else None,
+                model_basename=self.model_basename,
+                stop_callback=stop_cb,
+                progress_callback=progress_cb,
+                nn_type=self.nn_type,
+                architecture=self.architecture,
+                custom_hidden_sizes=self.custom_hidden_sizes,
+                dropout=self.dropout,
+                use_dropout=self.use_dropout,
+                device=self.device,
+            )
+            if self._stop_requested:
+                self.error.emit("Stopped by user.")
+                return
+            self.progress.emit(100, "Done.")
+            self.finished.emit({
+                "n_bars": self.n_bars,
+                "n_trades": len(self.trades),
+                "trades": self.trades,
+                "model": model,
+                "scaling": scaling,
+                "out_dir": self.out_dir,
+            })
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.trace.emit("error", f"Train NN error: {e}\n{tb}")
+            self.error.emit(str(e))
+
+
+class FinalBacktestWorker(QObject):
+    """Run baseline (no filter) then filtered (with NN) on same test data; emit both for comparison."""
+    finished = Signal(object)  # baseline_metrics, baseline_equity, baseline_trades, filtered_*, n_bars
+    error = Signal(str)
+    progress = Signal(int, str)
+    equity_point = Signal(int, float)  # unused; we send full curves at end
+    trace = Signal(str, str)
 
     def __init__(
         self,
@@ -343,6 +473,8 @@ class FinalBacktestWorker(QObject):
         system_tf_str: str,
         day_offset: int,
         model_dir: Optional[str],
+        model_basename: Optional[str] = None,
+        in_memory_model: Optional[tuple] = None,
     ) -> None:
         super().__init__()
         self.csv_path = csv_path
@@ -352,6 +484,8 @@ class FinalBacktestWorker(QObject):
         self.system_tf_str = system_tf_str
         self.day_offset = day_offset
         self.model_dir = model_dir
+        self.model_basename = model_basename
+        self.in_memory_model = in_memory_model
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -374,42 +508,72 @@ class FinalBacktestWorker(QObject):
                 return
             o, h, l, c, vol, spread = df_to_arrays(df_app)
             n_bars = len(c)
-            self.progress.emit(20, "Running final backtest...")
             point = _point_from_mintick(self.symbol.mintick)
             scale_factor = system_tf_min / data_tf_min if data_tf_min else 1.0
             backtest_params = _scale_ea_params_for_timeframe(self.params, scale_factor)
 
-            def equity_cb(bar: int, cum: float) -> None:
-                self.equity_point.emit(bar, cum)
-
             def stop_cb() -> bool:
                 return self._stop_requested
 
-            all_trades = run_backtest(
+            # Phase 1: Baseline backtest (test data, NO filter) — 0–50%
+            self.progress.emit(5, "Running Baseline Backtest (1/2)...")
+            def baseline_progress(current: int, total: int) -> None:
+                if total <= 0:
+                    return
+                pct = 5 + int(45 * (current + 1) / total)
+                self.progress.emit(min(pct, 50), "Running Baseline Backtest (1/2)...")
+
+            baseline_trades = run_backtest(
                 o, h, l, c,
                 backtest_params,
                 tick_value=self.symbol.tick_value,
                 point=point,
                 lot_size=self.symbol.default_lots,
-                equity_callback=equity_cb,
+                equity_callback=None,
                 stop_callback=stop_cb,
+                progress_callback=baseline_progress,
             )
             if self._stop_requested:
                 self.error.emit("Stopped by user.")
                 return
-            if not self.model_dir or not Path(self.model_dir).exists():
-                filtered_trades = all_trades
+            baseline_metrics = compute_backtest_metrics(baseline_trades, n_bars)
+            baseline_equity = compute_equity_curve(baseline_trades, n_bars)
+
+            # Phase 2: Filtered backtest (same test data, WITH NN) — 50–100%
+            self.progress.emit(50, "Running Filtered Backtest (2/2)...")
+            if self.in_memory_model is not None:
+                model, scaling = self.in_memory_model
+                filtered_trades = filter_trades_by_nn(baseline_trades, model, scaling)
+                self.trace.emit("info", "Using NN model from memory (trained this session).")
+            elif self.model_dir and Path(self.model_dir).exists():
+                model, scaling = load_filter_model(Path(self.model_dir), self.model_basename)
+                filtered_trades = filter_trades_by_nn(baseline_trades, model, scaling)
+                self.trace.emit("info", f"NN model loaded from: {self.model_dir}")
             else:
-                self.progress.emit(70, "Applying NN filter...")
-                model, scaling = load_filter_model(Path(self.model_dir))
-                filtered_trades = filter_trades_by_nn(all_trades, model, scaling)
-            metrics = compute_backtest_metrics(filtered_trades, n_bars)
-            equity_curve = compute_equity_curve(filtered_trades, n_bars)
-            self.progress.emit(100, "Done.")
+                self.trace.emit(
+                    "warning",
+                    "No NN model: none in memory and Output directory is empty or path does not exist. "
+                    "Filtered backtest = Baseline (results will be identical). "
+                    "Run 'Backtest and Train NN' first, or set Output directory to a folder with a saved model.",
+                )
+                filtered_trades = baseline_trades
+            def filtered_progress(current: int, total: int) -> None:
+                if total <= 0:
+                    return
+                pct = 50 + int(50 * (current + 1) / total)
+                self.progress.emit(min(pct, 99), "Running Filtered Backtest (2/2)...")
+            # No second run_backtest; we already have baseline_trades and filtered_trades
+            filtered_metrics = compute_backtest_metrics(filtered_trades, n_bars)
+            filtered_equity = compute_equity_curve(filtered_trades, n_bars)
+
+            self.progress.emit(100, "Final Backtest Complete")
             self.finished.emit({
-                "metrics": metrics,
+                "baseline_metrics": baseline_metrics,
+                "baseline_equity_curve": baseline_equity,
+                "baseline_trades": baseline_trades,
+                "filtered_metrics": filtered_metrics,
+                "filtered_equity_curve": filtered_equity,
                 "filtered_trades": filtered_trades,
-                "equity_curve": equity_curve,
                 "n_bars": n_bars,
             })
         except Exception as e:
@@ -420,15 +584,21 @@ class FinalBacktestWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("MAFilter NN — Trade Filter")
-        # Extra height for EA params and results (902 + 100 = 1002)
-        self.setMinimumSize(860, 1002)
-        self.resize(860, 1002)
+        self.setWindowTitle(f"MAFilter NN Trainer v{APP_VERSION}")
+        # Width +10% for side-by-side comparison; height for full results
+        self.setMinimumSize(946, 1200)
+        self.resize(946, 1200)
         self._df = None
         self._trades = []
         self._worker: Optional[QThread] = None
         self._final_worker: Optional[QThread] = None
-        self._log_file = LogFile()
+        self._log_file = LogFile(get_config_path().parent)
+        self._training_backtest_metrics: Optional[dict] = None
+        self._trained_model = None
+        self._trained_scaling: Optional[dict] = None
+        self._last_backtest_result: Optional[dict] = None
+        self._train_worker: Optional[QThread] = None
+        self._train_worker_obj: Optional[QObject] = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -461,12 +631,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._load_and_apply_config)
 
     def _load_and_apply_config(self) -> None:
+        # Start log file so it exists for the whole session (trace + file)
+        log_path = self._log_file.start()
         config, err = load_config()
         if err:
             self._log(f"Config: {err}, using defaults.", "info")
             self.trace.append("Config file corrupted or invalid, using defaults.", "warning")
         else:
             self._log(f"Configuration loaded from {get_config_path()}", "info")
+        self._log(f"Log file: {log_path}", "info")
         self._apply_config(config)
         dev_text = self.device_combo.currentText()
         if dev_text.startswith("CUDA"):
@@ -541,8 +714,8 @@ class MainWindow(QMainWindow):
         # Window
         if "window" in config:
             w = config["window"]
-            width = w.get("width", 860)
-            height = w.get("height", 902)
+            width = w.get("width", 946)
+            height = w.get("height", 1200)
             self.resize(width, height)
             if "position_x" in w and "position_y" in w:
                 self.move(w["position_x"], w["position_y"])
@@ -620,8 +793,8 @@ class MainWindow(QMainWindow):
                 idx = self.norm_method_combo.findText(lb.get("normalization", "Dynamic (per window)"))
                 if idx >= 0:
                     self.norm_method_combo.setCurrentIndex(idx)
-            if "output_dir" in bt:
-                self.out_dir_edit.setText(bt.get("output_dir", "") or "")
+            default_output_dir = str(get_config_path().parent / "models")
+            self.out_dir_edit.setText(bt.get("output_dir", "") or default_output_dir)
             if "device" in bt:
                 idx = self.device_combo.findText(bt["device"])
                 if idx >= 0:
@@ -904,7 +1077,9 @@ class MainWindow(QMainWindow):
         scroll_layout.addWidget(lb_group)
 
         self.out_dir_edit = QLineEdit()
-        self.out_dir_edit.setPlaceholderText("Directory to save model (best.pt, scaling.json) — required for Final Backtest")
+        default_models_dir = str(get_config_path().parent / "models")
+        self.out_dir_edit.setPlaceholderText(f"Model saved as model_type_MAFilter.pt")
+        self.out_dir_edit.setText(default_models_dir)
         out_row = QFormLayout()
         out_row.addRow("Output directory", self.out_dir_edit)
         scroll_layout.addLayout(out_row)
@@ -913,10 +1088,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(scroll)
 
         btn_row = QHBoxLayout()
-        self.run_btn = QPushButton("Start Backtest and Train NN")
-        self.run_btn.setStyleSheet("background-color: #1E90FF; color: white;")
-        self.run_btn.clicked.connect(self._run_train)
-        btn_row.addWidget(self.run_btn)
+        self.backtest_btn = QPushButton("Backtest")
+        self.backtest_btn.setStyleSheet("background-color: #1E90FF; color: white;")
+        self.backtest_btn.clicked.connect(self._run_backtest)
+        btn_row.addWidget(self.backtest_btn)
+        self.train_nn_btn = QPushButton("Train NN")
+        self.train_nn_btn.setStyleSheet("background-color: #228B22; color: white;")
+        self.train_nn_btn.setEnabled(False)
+        self.train_nn_btn.clicked.connect(self._run_train_nn)
+        btn_row.addWidget(self.train_nn_btn)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setStyleSheet("background-color: #8B0000; color: white;")
         self.stop_btn.setEnabled(False)
@@ -995,73 +1175,20 @@ class MainWindow(QMainWindow):
         final_equity_layout.addWidget(self.equity_curve_final)
         layout.addWidget(equity_frame_final)
 
-        layout.addWidget(QLabel("Final backtest results"))
-        # Three-column layout: more compact vertically, labels left, values right; monospace; color by sign
-        results_row = QHBoxLayout()
-        col1_layout = QGridLayout()
-        col2_layout = QGridLayout()
-        col3_layout = QGridLayout()
-        _result_row_h = 18
-        for g in (col1_layout, col2_layout, col3_layout):
-            g.setVerticalSpacing(4)
-        self._result_labels = {}
-        col1_spec = [
-            ("Net Profit:", "net_profit"), ("Total Profit:", "total_profit"), ("Total Loss:", "total_loss"),
-            ("Profit Factor:", "profit_factor"), ("Sharpe Ratio:", "sharpe_ratio"), ("Z-Score:", "z_score"),
-            ("Max. DD (abs):", "max_drawdown_abs"), ("Max. DD (rel):", "max_drawdown_pct"),
-        ]
-        col2_spec = [
-            ("# Long Won:", "n_long_won"), ("# Long Lost:", "n_long_lost"),
-            ("# Short Won:", "n_short_won"), ("# Short Lost:", "n_short_lost"),
-            ("Total # Trades:", "total_trades"), ("# Long:", "n_long"), ("# Short:", "n_short"),
-        ]
-        col3_spec = [
-            ("Avg. Win Trade:", "avg_win_trade"), ("Avg. Loss Trade:", "avg_loss_trade"),
-            ("Avg. Win Long:", "avg_win_long_trade"), ("Avg. Loss Long:", "avg_loss_long_trade"),
-            ("Avg. Win Short:", "avg_win_short_trade"), ("Avg. Loss Short:", "avg_loss_short_trade"),
-            ("Largest Win:", "largest_win_trade"), ("Largest Loss:", "largest_loss_trade"),
-        ]
-
-        def add_result_column(grid: QGridLayout, spec: list[tuple[str, str]]) -> None:
-            for i, (label_text, key) in enumerate(spec):
-                name_lbl = QLabel(label_text)
-                name_lbl.setMinimumHeight(_result_row_h)
-                val_lbl = QLabel("—")
-                val_lbl.setMinimumHeight(_result_row_h)
-                val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                val_lbl.setStyleSheet("font-family: monospace;")
-                self._result_labels[key] = val_lbl
-                grid.addWidget(name_lbl, i, 0)
-                grid.addWidget(val_lbl, i, 1)
-
-        add_result_column(col1_layout, col1_spec)
-        add_result_column(col2_layout, col2_spec)
-        add_result_column(col3_layout, col3_spec)
-        col1_w = QWidget()
-        col1_w.setLayout(col1_layout)
-        col2_w = QWidget()
-        col2_w.setLayout(col2_layout)
-        col3_w = QWidget()
-        col3_w.setLayout(col3_layout)
-        results_row.addWidget(col1_w)
-        results_row.addSpacing(COLUMN_SPACING)
-        d1 = QFrame()
-        d1.setFrameShape(QFrame.Shape.VLine)
-        d1.setStyleSheet("color: #444;")
-        results_row.addWidget(d1)
-        results_row.addSpacing(COLUMN_SPACING)
-        results_row.addWidget(col2_w)
-        results_row.addSpacing(COLUMN_SPACING)
-        d2 = QFrame()
-        d2.setFrameShape(QFrame.Shape.VLine)
-        d2.setStyleSheet("color: #444;")
-        results_row.addWidget(d2)
-        results_row.addSpacing(COLUMN_SPACING)
-        results_row.addWidget(col3_w)
-        results_row.addStretch()
-        results_container = QWidget()
-        results_container.setLayout(results_row)
-        layout.addWidget(results_container)
+        layout.addWidget(QLabel("Final Backtest Results — Baseline vs Filtered (scrollable)"))
+        self._results_table = QTableWidget()
+        self._results_table.setColumnCount(4)
+        self._results_table.setHorizontalHeaderLabels(["Metric", "Baseline (No Filter)", "Filtered (NN)", "Change"])
+        self._results_table.horizontalHeader().setStretchLastSection(True)
+        self._results_table.setAlternatingRowColors(True)
+        self._results_table.setStyleSheet(
+            "font-family: monospace; font-size: 9pt; background-color: #2b2b2b; color: #ffffff;"
+        )
+        self._results_table.setMinimumHeight(400)
+        results_scroll = QScrollArea()
+        results_scroll.setWidget(self._results_table)
+        results_scroll.setWidgetResizable(True)
+        layout.addWidget(results_scroll)
 
         self._form_inputs_p3 = (
             self.lot_size_p3, self.min_len_p3, self.max_len_p3, self.nbr_ma_p3,
@@ -1176,6 +1303,38 @@ class MainWindow(QMainWindow):
         self.trace.append(msg, level=level)
         self._log_file.write(level, msg)
 
+    def _log_backtest_metrics_to_trace(self, m: dict, title: str) -> None:
+        """Emit full backtest stats to trace with color: GREEN positive, ORANGE loss, CYAN neutral."""
+        net = m.get("net_profit", 0)
+        z = m.get("z_score", 0)
+        self._log(f"========== {title} ==========", "result")
+        self._log(f"Net Profit: ${net:,.2f}", "positive" if net > 0 else "warning")
+        self._log(f"Total Profit: ${m.get('total_profit', 0):,.2f}", "positive")
+        tl = m.get("total_loss", 0)
+        self._log(f"Total Loss: -${tl:,.2f}", "warning")
+        self._log(f"Profit Factor: {m.get('profit_factor', 0):.2f}", "positive")
+        self._log(f"Sharpe Ratio: {m.get('sharpe_ratio', 0):.2f}", "positive")
+        self._log(f"Z-Score: {z:.2f}", "positive" if z > 0 else "warning")
+        self._log(f"Max. Drawdown (absolute): -${m.get('max_drawdown_abs', 0):,.2f}", "warning")
+        self._log(f"Max. Drawdown (relative): {m.get('max_drawdown_pct', 0):.2f}%", "warning")
+        self._log(f"# Trades: {int(m.get('total_trades', 0))}", "result")
+        self._log(f"# Long: {int(m.get('n_long', 0))}", "result")
+        self._log(f"# Short: {int(m.get('n_short', 0))}", "result")
+        self._log(f"# Long Won: {int(m.get('n_long_won', 0))}", "positive")
+        self._log(f"# Long Lost: {int(m.get('n_long_lost', 0))}", "warning")
+        self._log(f"# Short Won: {int(m.get('n_short_won', 0))}", "positive")
+        self._log(f"# Short Lost: {int(m.get('n_short_lost', 0))}", "warning")
+        self._log(f"Avg. Win Trade: ${m.get('avg_win_trade', 0):,.2f}", "positive")
+        self._log(f"Avg. Loss Trade: -${abs(m.get('avg_loss_trade', 0)):,.2f}", "warning")
+        self._log(f"Avg. Win Long Trade: ${m.get('avg_win_long_trade', 0):,.2f}", "positive")
+        self._log(f"Avg. Loss Long Trade: -${abs(m.get('avg_loss_long_trade', 0)):,.2f}", "warning")
+        self._log(f"Avg. Win Short Trade: ${m.get('avg_win_short_trade', 0):,.2f}", "positive")
+        self._log(f"Avg. Loss Short Trade: -${abs(m.get('avg_loss_short_trade', 0)):,.2f}", "warning")
+        self._log(f"Largest Win Trade: ${m.get('largest_win_trade', 0):,.2f}", "positive")
+        ll = m.get("largest_loss_trade", 0)
+        self._log(f"Largest Loss Trade: ${ll:,.2f}", "warning")
+        self._log("=========================================================", "result")
+
     def _ea_params(self) -> EAParams:
         return EAParams(
             lot_size=self.lot_size.value(),
@@ -1199,7 +1358,7 @@ class MainWindow(QMainWindow):
             default_lots=self.default_lots.value(),
         )
 
-    def _run_train(self) -> None:
+    def _run_backtest(self) -> None:
         path = self.csv_path_edit.text().strip()
         if not path or not Path(path).exists():
             QMessageBox.warning(self, "Error", "Select a valid CSV file.")
@@ -1216,31 +1375,26 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Please wait",
-                "Previous run is still stopping. Please wait a moment and try again.",
+                "Previous backtest is still stopping. Please wait and try again.",
+            )
+            return
+        if self._train_worker is not None and self._train_worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Please wait",
+                "Train NN is still running. Please wait and try again.",
             )
             return
         self._cleanup_worker()
         out_dir = self.out_dir_edit.text().strip() or None
-        self.run_btn.setEnabled(False)
-        self.run_btn.setText("Backtest and Train...")
-        self.run_btn.setStyleSheet("background-color: #00BFFF; color: white;")
+        self.backtest_btn.setEnabled(False)
+        self.train_nn_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.stop_btn.setStyleSheet("background-color: #B22222; color: white;")
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.progress_label.setText("Starting...")
+        self.progress_label.setText("Starting backtest...")
         self.equity_curve_train.clear()
-        log_path = self._log_file.start()
-        self._log(f"Log file: {log_path}", "info")
-        self._log("Starting: load CSV → backtest (training part) → train NN...", "info")
-        device_text = self.device_combo.currentText()
-        self._log(f"Training on device: {device_text}", "info")
-        self._log(
-            f"NN: type={self.nn_type_combo.currentText()}, arch={self.arch_combo.currentText()}, "
-            f"dropout={self.dropout_slider.value()/100:.2f}, lookback={self.lookback_enable_check.isChecked()}, "
-            f"length={self.lookback_length_slider.value()}, norm={self.norm_method_combo.currentText()}",
-            "info",
-        )
+        self._log("Starting backtest (training part of data)...", "info")
 
         self._worker = QThread()
         nn_type = self.nn_type_combo.currentText()
@@ -1255,6 +1409,7 @@ class MainWindow(QMainWindow):
             custom_sizes = None
         dropout_val = self.dropout_slider.value() / 100.0
         use_dropout = self.use_dropout_check.isChecked()
+        model_basename = f"{nn_type.split()[0] if nn_type else 'Dense'}_MAFilter"
 
         self._worker_obj = Worker(
             csv_path=path,
@@ -1265,6 +1420,7 @@ class MainWindow(QMainWindow):
             batch_size=self.batch_spin.value(),
             patience=self.patience_spin.value(),
             out_dir=out_dir,
+            model_basename=model_basename,
             data_tf_str=data_tf,
             system_tf_str=system_tf,
             day_offset=self.day_offset_slider.value(),
@@ -1273,12 +1429,13 @@ class MainWindow(QMainWindow):
             custom_hidden_sizes=custom_sizes,
             dropout=dropout_val,
             use_dropout=use_dropout,
-            device=device_text,
+            device=self.device_combo.currentText(),
+            do_training=False,
         )
         self._worker_obj.moveToThread(self._worker)
         self._worker.started.connect(self._worker_obj.run)
-        self._worker_obj.finished.connect(self._on_finished)
-        self._worker_obj.error.connect(self._on_error)
+        self._worker_obj.finished.connect(self._on_backtest_finished)
+        self._worker_obj.error.connect(self._on_backtest_error)
         self._worker_obj.progress.connect(self._on_progress)
         self._worker_obj.trace.connect(self._on_worker_trace)
         self._worker_obj.equity_point.connect(self.equity_curve_train.append_point)
@@ -1286,11 +1443,71 @@ class MainWindow(QMainWindow):
         self._worker_obj.error.connect(self._worker.quit)
         self._worker.start()
 
+    def _run_train_nn(self) -> None:
+        if self._last_backtest_result is None:
+            QMessageBox.warning(self, "Error", "Run Backtest first to get trades.")
+            return
+        if self._train_worker is not None and self._train_worker.isRunning():
+            QMessageBox.warning(self, "Please wait", "Train NN is already running.")
+            return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.warning(self, "Please wait", "Backtest is still running.")
+            return
+        self._cleanup_train_worker()
+        trades = self._last_backtest_result["trades"]
+        n_bars = self._last_backtest_result["n_bars"]
+        out_dir = self.out_dir_edit.text().strip() or None
+        nn_type = self.nn_type_combo.currentText()
+        arch = self.arch_combo.currentText()
+        if self.custom_arch_check.isChecked():
+            arch = "custom"
+            raw = self.custom_sizes_edit.text().strip()
+            custom_sizes = tuple(int(x.strip()) for x in raw.split(",") if x.strip().isdigit())
+            if not custom_sizes:
+                custom_sizes = (256, 128, 64)
+        else:
+            custom_sizes = None
+        model_basename = f"{nn_type.split()[0] if nn_type else 'Dense'}_MAFilter"
+
+        self.backtest_btn.setEnabled(False)
+        self.train_nn_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Training NN...")
+
+        self._train_worker = QThread()
+        self._train_worker_obj = TrainOnlyWorker(
+            trades=trades,
+            n_bars=n_bars,
+            good_threshold=self.good_threshold.value(),
+            epochs=self.epochs_spin.value(),
+            batch_size=self.batch_spin.value(),
+            patience=self.patience_spin.value(),
+            out_dir=out_dir,
+            model_basename=model_basename,
+            nn_type=nn_type,
+            architecture=arch,
+            custom_hidden_sizes=custom_sizes,
+            dropout=self.dropout_slider.value() / 100.0,
+            use_dropout=self.use_dropout_check.isChecked(),
+            device=self.device_combo.currentText(),
+        )
+        self._train_worker_obj.moveToThread(self._train_worker)
+        self._train_worker.started.connect(self._train_worker_obj.run)
+        self._train_worker_obj.finished.connect(self._on_train_nn_finished)
+        self._train_worker_obj.error.connect(self._on_train_nn_error)
+        self._train_worker_obj.progress.connect(self._on_progress)
+        self._train_worker_obj.trace.connect(self._on_worker_trace)
+        self._train_worker_obj.finished.connect(self._train_worker.quit)
+        self._train_worker_obj.error.connect(self._train_worker.quit)
+        self._train_worker.start()
+
     def _on_worker_trace(self, level: str, msg: str) -> None:
         self._log(msg, level)
 
     def _cleanup_worker(self) -> None:
-        """Disconnect signals, wait for thread to finish, release references. Prevents crash on next run."""
+        """Disconnect backtest worker, wait, release."""
         if self._worker is None or self._worker_obj is None:
             return
         try:
@@ -1298,8 +1515,8 @@ class MainWindow(QMainWindow):
         except (RuntimeError, TypeError):
             pass
         try:
-            self._worker_obj.finished.disconnect(self._on_finished)
-            self._worker_obj.error.disconnect(self._on_error)
+            self._worker_obj.finished.disconnect(self._on_backtest_finished)
+            self._worker_obj.error.disconnect(self._on_backtest_error)
             self._worker_obj.progress.disconnect(self._on_progress)
             self._worker_obj.trace.disconnect(self._on_worker_trace)
             self._worker_obj.equity_point.disconnect(self.equity_curve_train.append_point)
@@ -1313,6 +1530,29 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._worker_obj = None
 
+    def _cleanup_train_worker(self) -> None:
+        """Disconnect train NN worker, wait, release."""
+        if self._train_worker is None or self._train_worker_obj is None:
+            return
+        try:
+            self._train_worker.started.disconnect(self._train_worker_obj.run)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self._train_worker_obj.finished.disconnect(self._on_train_nn_finished)
+            self._train_worker_obj.error.disconnect(self._on_train_nn_error)
+            self._train_worker_obj.progress.disconnect(self._on_progress)
+            self._train_worker_obj.trace.disconnect(self._on_worker_trace)
+            self._train_worker_obj.finished.disconnect(self._train_worker.quit)
+            self._train_worker_obj.error.disconnect(self._train_worker.quit)
+        except (RuntimeError, TypeError):
+            pass
+        self._train_worker.quit()
+        if self._train_worker.isRunning():
+            self._train_worker.wait(2000)
+        self._train_worker = None
+        self._train_worker_obj = None
+
     def _on_progress(self, percent: int, message: str) -> None:
         self.progress_bar.setValue(percent)
         self.progress_label.setText(f"{percent}% — {message}")
@@ -1324,22 +1564,23 @@ class MainWindow(QMainWindow):
         self._log(message)
 
     def _stop_run(self) -> None:
-        if self._worker_obj is not None and self._worker is not None and self._worker.isRunning():
+        if self._worker is not None and self._worker.isRunning() and self._worker_obj is not None:
             self._worker_obj.request_stop()
             self.stop_btn.setText("Stopping...")
-            self._log("Stop requested. Worker will finish current step and stop.", "info")
-            # Do NOT block GUI with wait() or call terminate() - both can cause crashes.
-            # Worker checks _stop_requested in backtest loop and training batches and will emit error("Stopped by user.").
+            self._log("Stop requested (backtest). Worker will finish current step and stop.", "info")
+        elif self._train_worker is not None and self._train_worker.isRunning() and self._train_worker_obj is not None:
+            self._train_worker_obj.request_stop()
+            self.stop_btn.setText("Stopping...")
+            self._log("Stop requested (Train NN). Worker will finish current step and stop.", "info")
 
-    def _on_finished(self, result: dict) -> None:
-        self.run_btn.setEnabled(True)
-        self.run_btn.setText("Start Backtest and Train NN")
-        self.run_btn.setStyleSheet("background-color: #1E90FF; color: white;")
+    def _on_backtest_finished(self, result: dict) -> None:
+        self.backtest_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setText("Stop")
-        self.stop_btn.setStyleSheet("background-color: #8B0000; color: white;")
         self.progress_bar.setVisible(False)
         self.progress_label.setText("")
+        self._last_backtest_result = result
+        self.train_nn_btn.setEnabled(True)
         if "first_date" in result:
             self.date_first_label.setText(f"First date: {result['first_date']}")
         if "split_date" in result:
@@ -1352,21 +1593,63 @@ class MainWindow(QMainWindow):
         net_profit = result.get("net_profit", 0.0)
         net_loss = result.get("net_loss", 0.0)
         self._log(
-            f"Done. Bars: {n_bars}, Trades: {n_trades}, Good: {n_good}, Bad: {n_trades - n_good} | "
+            f"Backtest done. Bars: {n_bars}, Trades: {n_trades}, Good: {n_good}, Bad: {n_trades - n_good} | "
             f"Net Profit: {net_profit:.2f}, Net Loss: {net_loss:.2f}",
             "result",
         )
-        if result.get("out_dir"):
-            self._log(f"Model saved to: {result['out_dir']}", "info")
+        self._log("Train NN is now enabled. Adjust NN settings and click Train NN to train (or train multiple configs).", "info")
+        training_metrics = compute_backtest_metrics(result["trades"], result["n_bars"])
+        self._training_backtest_metrics = training_metrics
+        self._log_backtest_metrics_to_trace(training_metrics, "Backtest Results (Training Phase)")
+        # Update equity curve from backtest result
+        equity_curve = compute_equity_curve(result["trades"], n_bars)
+        points = [(i, eq) for i, eq in enumerate(equity_curve)]
+        self.equity_curve_train.set_points(points)
         self._cleanup_worker()
 
-    def _on_error(self, err: str) -> None:
-        self.run_btn.setEnabled(True)
-        self.run_btn.setText("Start Backtest and Train NN")
-        self.run_btn.setStyleSheet("background-color: #1E90FF; color: white;")
+    def _on_backtest_error(self, err: str) -> None:
+        self.backtest_btn.setEnabled(True)
+        self.train_nn_btn.setEnabled(self._last_backtest_result is not None)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setText("Stop")
-        self.stop_btn.setStyleSheet("background-color: #8B0000; color: white;")
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
+        self._log(f"Backtest error: {err}", "error")
+        QMessageBox.critical(self, "Backtest Error", err)
+        self._cleanup_worker()
+
+    def _on_train_nn_finished(self, result: dict) -> None:
+        self.backtest_btn.setEnabled(True)
+        self.train_nn_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("Stop")
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
+        self._trained_model = result.get("model")
+        self._trained_scaling = result.get("scaling")
+        if self._trained_model is not None:
+            self._log("Model kept in memory for Final Backtest (same session).", "info")
+        if result.get("out_dir"):
+            self._log(f"Model saved to: {result['out_dir']}", "info")
+        self._log("Train NN done. You can change NN settings and run Train NN again, or run Final Backtest.", "result")
+        self._cleanup_train_worker()
+
+    def _on_train_nn_error(self, err: str) -> None:
+        self.backtest_btn.setEnabled(True)
+        self.train_nn_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("Stop")
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
+        self._log(f"Train NN error: {err}", "error")
+        QMessageBox.critical(self, "Train NN Error", err)
+        self._cleanup_train_worker()
+
+    def _on_error(self, err: str) -> None:
+        """Legacy error handler; backtest now uses _on_backtest_error."""
+        self.backtest_btn.setEnabled(True)
+        self.train_nn_btn.setEnabled(self._last_backtest_result is not None)
+        self.stop_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
         self.progress_label.setText("")
         self._log(f"Error: {err}", "error")
@@ -1387,13 +1670,34 @@ class MainWindow(QMainWindow):
             return
         self._cleanup_final_worker()
         out_dir = self.out_dir_edit.text().strip() or None
+        in_memory = (self._trained_model is not None and self._trained_scaling is not None)
+        if not in_memory and (not out_dir or not Path(out_dir).exists()):
+            reply = QMessageBox.warning(
+                self,
+                "No model",
+                "No NN model in memory and Output directory is empty or path does not exist.\n\n"
+                "Baseline and Filtered results will be identical.\n\n"
+                "To use the NN filter: run 'Backtest and Train NN' first (model is kept in memory), "
+                "or set Output directory to a folder with a saved model.\n\n"
+                "Run anyway (Baseline only)?",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+        # Model basename for loading from disk: model_type_Strategy_Name
+        nn_type_text = self.nn_type_combo.currentText()
+        model_type_short = nn_type_text.split()[0] if nn_type_text else "Dense"
+        model_basename = f"{model_type_short}_MAFilter"
+        in_memory_model = (self._trained_model, self._trained_scaling) if in_memory else None
         self.run_final_btn.setEnabled(False)
         self.run_final_btn.setText("Final Backtest...")
         self.run_final_btn.setStyleSheet("background-color: #00BFFF; color: white;")
         self.stop_final_btn.setEnabled(True)
         self.stop_final_btn.setStyleSheet("background-color: #B22222; color: white;")
         self.equity_curve_final.clear()
-        self._log("Starting final backtest (application part, NN filter applied)...", "info")
+        self._log("========== Final Backtest Started ==========", "info")
+        self._log("Running Baseline (1/2) then Filtered (2/2) on same test data...", "info")
 
         self._final_worker = QThread()
         self._final_worker_obj = FinalBacktestWorker(
@@ -1404,6 +1708,8 @@ class MainWindow(QMainWindow):
             system_tf_str=self.system_timeframe.currentText(),
             day_offset=self.day_offset_slider.value(),
             model_dir=out_dir,
+            model_basename=model_basename,
+            in_memory_model=in_memory_model,
         )
         self._final_worker_obj.moveToThread(self._final_worker)
         self._final_worker.started.connect(self._final_worker_obj.run)
@@ -1411,7 +1717,6 @@ class MainWindow(QMainWindow):
         self._final_worker_obj.error.connect(self._on_final_error)
         self._final_worker_obj.progress.connect(self._on_final_progress)
         self._final_worker_obj.trace.connect(self._on_final_worker_trace)
-        self._final_worker_obj.equity_point.connect(self.equity_curve_final.append_point)
         self._final_worker_obj.finished.connect(self._final_worker.quit)
         self._final_worker_obj.error.connect(self._final_worker.quit)
         self._final_worker.start()
@@ -1431,7 +1736,6 @@ class MainWindow(QMainWindow):
             self._final_worker_obj.error.disconnect(self._on_final_error)
             self._final_worker_obj.progress.disconnect(self._on_final_progress)
             self._final_worker_obj.trace.disconnect(self._on_final_worker_trace)
-            self._final_worker_obj.equity_point.disconnect(self.equity_curve_final.append_point)
             self._final_worker_obj.finished.disconnect(self._final_worker.quit)
             self._final_worker_obj.error.disconnect(self._final_worker.quit)
         except (RuntimeError, TypeError):
@@ -1452,6 +1756,187 @@ class MainWindow(QMainWindow):
     def _on_final_progress(self, percent: int, message: str) -> None:
         self.progress_label.setText(f"{percent}% — {message}")
 
+    def _populate_final_results_table(
+        self,
+        baseline_metrics: dict,
+        filtered_metrics: dict,
+        baseline_trades: list,
+        filtered_trades: list,
+    ) -> None:
+        """Fill 4-column comparison table: Metric | Baseline | Filtered | Change. Includes NN Filter Analysis and Confusion Matrix."""
+        green = "color: #00FF00;"
+        orange = "color: #FFA500;"
+        white = "color: #ffffff;"
+        higher_better = {
+            "net_profit", "total_profit", "profit_factor", "sharpe_ratio", "z_score",
+            "n_long_won", "n_short_won", "avg_win_trade", "avg_win_long_trade", "avg_win_short_trade",
+            "largest_win_trade", "win_rate",
+        }
+        lower_better = {
+            "total_loss", "max_drawdown_abs", "max_drawdown_pct",
+            "n_long_lost", "n_short_lost", "avg_loss_trade", "avg_loss_long_trade", "avg_loss_short_trade",
+            "largest_loss_trade",
+        }
+        currency_keys = {
+            "net_profit", "total_profit", "total_loss", "avg_win_trade", "avg_loss_trade",
+            "avg_win_long_trade", "avg_loss_long_trade", "avg_win_short_trade", "avg_loss_short_trade",
+            "largest_win_trade", "largest_loss_trade", "max_drawdown_abs",
+        }
+        percent_keys = {"max_drawdown_pct", "win_rate"}
+        int_keys = {"total_trades", "n_long", "n_short", "n_long_won", "n_long_lost", "n_short_won", "n_short_lost"}
+
+        def fmt_baseline(key: str, m: dict) -> str:
+            val = m.get(key, 0)
+            if key == "total_loss":
+                return f"-${val:,.2f}"
+            if key == "max_drawdown_abs":
+                return f"-${val:,.2f}"
+            if key in currency_keys:
+                return f"${val:,.2f}"
+            if key in percent_keys:
+                return f"{val:.1f}%" if key == "win_rate" else f"{val:.2f}%"
+            if key in int_keys:
+                return str(int(val))
+            if isinstance(val, float):
+                return f"{val:.2f}" if abs(val) < 1e6 else f"{val:.4f}"
+            return str(val)
+
+        def cell_style(val: float, is_loss_metric: bool) -> str:
+            if is_loss_metric:
+                return orange if val != 0 else white
+            return green if val > 0 else (orange if val < 0 else white)
+
+        # Win rate computed
+        def win_rate(m: dict) -> float:
+            n = m.get("total_trades", 0) or 0
+            if n == 0:
+                return 0.0
+            w = m.get("n_long_won", 0) + m.get("n_short_won", 0)
+            return w / n * 100.0
+
+        baseline_metrics = dict(baseline_metrics)
+        filtered_metrics = dict(filtered_metrics)
+        baseline_metrics["win_rate"] = win_rate(baseline_metrics)
+        filtered_metrics["win_rate"] = win_rate(filtered_metrics)
+
+        loss_keys = {"total_loss", "max_drawdown_abs", "max_drawdown_pct", "n_long_lost", "n_short_lost", "avg_loss_trade", "avg_loss_long_trade", "avg_loss_short_trade", "largest_loss_trade"}
+
+        metric_spec = [
+            ("Net Profit", "net_profit"), ("Total Profit", "total_profit"), ("Total Loss", "total_loss"),
+            ("Profit Factor", "profit_factor"), ("Sharpe Ratio", "sharpe_ratio"), ("Z-Score", "z_score"),
+            ("Max DD (absolute)", "max_drawdown_abs"), ("Max DD (relative)", "max_drawdown_pct"),
+            ("# Trades", "total_trades"), ("# Long", "n_long"), ("# Short", "n_short"),
+            ("# Long Won", "n_long_won"), ("# Long Lost", "n_long_lost"),
+            ("# Short Won", "n_short_won"), ("# Short Lost", "n_short_lost"),
+            ("Avg. Win Trade", "avg_win_trade"), ("Avg. Loss Trade", "avg_loss_trade"),
+            ("Avg. Win Long", "avg_win_long_trade"), ("Avg. Loss Long", "avg_loss_long_trade"),
+            ("Avg. Win Short", "avg_win_short_trade"), ("Avg. Loss Short", "avg_loss_short_trade"),
+            ("Largest Win", "largest_win_trade"), ("Largest Loss", "largest_loss_trade"),
+            ("Win Rate", "win_rate"),
+        ]
+
+        rows: list[tuple[str, str, str, str, str, str, str]] = []  # metric, baseline_txt, filtered_txt, change_txt, baseline_style, filtered_style, change_style
+
+        for label, key in metric_spec:
+            b_val = baseline_metrics.get(key, 0)
+            f_val = filtered_metrics.get(key, 0)
+            b_txt = fmt_baseline(key, baseline_metrics)
+            f_txt = fmt_baseline(key, filtered_metrics)
+            is_loss = key in loss_keys
+            # Change %
+            if isinstance(b_val, (int, float)) and isinstance(f_val, (int, float)):
+                if key in lower_better:
+                    # improvement when filtered is less bad (e.g. -500 vs -892) -> (filtered - baseline)/|baseline|
+                    if abs(b_val) < 1e-12:
+                        ch_txt = "N/A"
+                        ch_style = white
+                    else:
+                        pct = (f_val - b_val) / abs(b_val) * 100.0
+                        ch_txt = f"{pct:+.1f}%"
+                        ch_style = green if pct > 0 else (orange if pct < 0 else white)
+                elif key in higher_better:
+                    if abs(b_val) < 1e-12:
+                        ch_txt = "N/A" if abs(f_val) < 1e-12 else "+100%"
+                        ch_style = white if ch_txt == "N/A" else green
+                    else:
+                        pct = (f_val - b_val) / abs(b_val) * 100.0
+                        ch_txt = f"{pct:+.1f}%"
+                        ch_style = green if pct > 0 else (orange if pct < 0 else white)
+                else:
+                    # neutral
+                    if abs(b_val) < 1e-12:
+                        ch_txt = "N/A"
+                    else:
+                        pct = (f_val - b_val) / abs(b_val) * 100.0
+                        ch_txt = f"{pct:+.1f}%"
+                    ch_style = white
+            else:
+                ch_txt = "—"
+                ch_style = white
+            b_style = cell_style(b_val if isinstance(b_val, (int, float)) else 0, is_loss)
+            f_style = cell_style(f_val if isinstance(f_val, (int, float)) else 0, is_loss)
+            rows.append((label, b_txt, f_txt, ch_txt, b_style, f_style, ch_style))
+
+        # NN Filter Analysis
+        filtered_set = {(t.exit_bar, t.profit, t.direction) for t in filtered_trades}
+        n_base = len(baseline_trades)
+        n_filt = len(filtered_trades)
+        profitable_filtered_out = sum(1 for t in baseline_trades if t.profit > 0 and (t.exit_bar, t.profit, t.direction) not in filtered_set)
+        loss_filtered = sum(1 for t in baseline_trades if t.profit <= 0 and (t.exit_bar, t.profit, t.direction) not in filtered_set)
+        profitable_passed = sum(1 for t in filtered_trades if t.profit > 0)
+        loss_passed = sum(1 for t in filtered_trades if t.profit <= 0)
+        filtered_out = n_base - n_filt
+        pct_filtered = (filtered_out / n_base * 100.0) if n_base else 0.0
+        rows.append(("", "", "", "", white, white, white))
+        rows.append(("— NN Filter Analysis —", "", "", "", white, white, white))
+        rows.append(("Trades Filtered Out", "N/A", str(filtered_out), f"{pct_filtered:.1f}% of total", white, white, white))
+        rows.append(("  - Profitable (FN)", "N/A", str(profitable_filtered_out), f"{profitable_filtered_out/max(1,filtered_out)*100:.1f}%" if filtered_out else "N/A", white, orange if profitable_filtered_out > 0.10 * max(1, sum(1 for t in baseline_trades if t.profit > 0)) else white, white))
+        rows.append(("  - Loss (TN)", "N/A", str(loss_filtered), f"{loss_filtered/max(1,filtered_out)*100:.1f}%" if filtered_out else "N/A", white, green, white))
+        rows.append(("Trades Let Through", "N/A", str(n_filt), f"{(n_filt/n_base*100):.1f}% of total" if n_base else "N/A", white, white, white))
+        rows.append(("  - Profitable (TP)", "N/A", str(profitable_passed), f"{profitable_passed/max(1,n_filt)*100:.1f}%" if n_filt else "N/A", white, green, white))
+        rows.append(("  - Loss (FP)", "N/A", str(loss_passed), f"{loss_passed/max(1,n_filt)*100:.1f}%" if n_filt else "N/A", white, orange if loss_passed > 0.20 * max(1, sum(1 for t in baseline_trades if t.profit <= 0)) else white, white))
+
+        # Confusion Matrix
+        tp, fp = profitable_passed, loss_passed
+        fn, tn = profitable_filtered_out, loss_filtered
+        rows.append(("", "", "", "", white, white, white))
+        rows.append(("— Confusion Matrix —", "", "", "", white, white, white))
+        rows.append(("", "Actually Profitable", "Actually Loss", "", white, white, white))
+        rows.append(("NN: Trade", f"{tp} (TP)", f"{fp} (FP)", "", white, white, white))
+        rows.append(("NN: No-Trade", f"{fn} (FN)", f"{tn} (TN)", "", white, white, white))
+        total_cm = tp + tn + fp + fn
+        precision = (tp / (tp + fp) * 100.0) if (tp + fp) > 0 else 0.0
+        recall = (tp / (tp + fn) * 100.0) if (tp + fn) > 0 else 0.0
+        specificity = (tn / (tn + fp) * 100.0) if (tn + fp) > 0 else 0.0
+        accuracy = ((tp + tn) / total_cm * 100.0) if total_cm > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        rows.append(("", "", "", "", white, white, white))
+        rows.append(("Precision", "N/A", f"{precision:.1f}%", "(TP/(TP+FP))", white, white, white))
+        rows.append(("Recall (Sensitivity)", "N/A", f"{recall:.1f}%", "(TP/(TP+FN))", white, white, white))
+        rows.append(("Specificity", "N/A", f"{specificity:.1f}%", "(TN/(TN+FP))", white, white, white))
+        rows.append(("Accuracy", "N/A", f"{accuracy:.1f}%", "((TP+TN)/Total)", white, white, white))
+        rows.append(("F1 Score", "N/A", f"{f1:.1f}%", "Harmonic mean", white, white, white))
+
+        self._results_table.setRowCount(len(rows))
+        for r, (label, b_txt, f_txt, ch_txt, b_style, f_style, ch_style) in enumerate(rows):
+            self._results_table.setItem(r, 0, QTableWidgetItem(label))
+            self._results_table.setItem(r, 1, QTableWidgetItem(b_txt))
+            self._results_table.setItem(r, 2, QTableWidgetItem(f_txt))
+            self._results_table.setItem(r, 3, QTableWidgetItem(ch_txt))
+            for c in range(4):
+                it = self._results_table.item(r, c)
+                if it:
+                    it.setForeground(QColor("#ffffff"))
+            it1 = self._results_table.item(r, 1)
+            if it1 and b_style != white:
+                it1.setForeground(QColor("#00FF00" if "00FF00" in b_style else "#FFA500"))
+            it2 = self._results_table.item(r, 2)
+            if it2 and f_style != white:
+                it2.setForeground(QColor("#00FF00" if "00FF00" in f_style else "#FFA500"))
+            it3 = self._results_table.item(r, 3)
+            if it3 and ch_style != white:
+                it3.setForeground(QColor("#00FF00" if "00FF00" in ch_style else "#FFA500"))
+
     def _on_final_finished(self, result: dict) -> None:
         self.run_final_btn.setEnabled(True)
         self.run_final_btn.setText("Start Final Backtest")
@@ -1459,54 +1944,28 @@ class MainWindow(QMainWindow):
         self.stop_final_btn.setEnabled(False)
         self.stop_final_btn.setText("Stop")
         self.stop_final_btn.setStyleSheet("background-color: #8B0000; color: white;")
-        metrics = result["metrics"]
-        # Color scheme: positive = green/cyan, negative = red/orange, neutral = white
-        positive_style = "color: #00FF00; font-family: monospace;"
-        negative_style = "color: #FFA500; font-family: monospace;"
-        neutral_style = "color: #000000; font-family: monospace;"
-        currency_keys = {
-            "net_profit", "total_profit", "total_loss", "avg_win_trade", "avg_loss_trade",
-            "avg_win_long_trade", "avg_loss_long_trade", "avg_win_short_trade", "avg_loss_short_trade",
-            "largest_win_trade", "largest_loss_trade", "max_drawdown_abs",
-        }
-        percent_keys = {"max_drawdown_pct"}
-        int_keys = {
-            "total_trades", "n_long", "n_short", "n_long_won", "n_long_lost",
-            "n_short_won", "n_short_lost",
-        }
-        for key, lbl in self._result_labels.items():
-            val = metrics.get(key, 0)
-            if key in currency_keys:
-                text = f"${val:,.2f}" if isinstance(val, (int, float)) else str(val)
-            elif key in percent_keys:
-                text = f"{val:.2f}%" if isinstance(val, (int, float)) else str(val)
-            elif key in int_keys:
-                text = f"{int(val)}" if isinstance(val, (int, float)) else str(val)
-            elif isinstance(val, float):
-                text = f"{val:.4f}" if (abs(val) < 1e-4 or abs(val) > 1e4) else f"{val:.2f}"
-            else:
-                text = str(val)
-            lbl.setText(text)
-            if isinstance(val, (int, float)):
-                if val > 0 and key in (
-                    "net_profit", "total_profit", "profit_factor", "sharpe_ratio", "z_score",
-                    "avg_win_trade", "avg_win_long_trade", "avg_win_short_trade",
-                    "largest_win_trade", "n_long_won", "n_short_won", "total_trades", "n_long", "n_short",
-                ):
-                    lbl.setStyleSheet(positive_style)
-                elif val < 0:
-                    lbl.setStyleSheet(negative_style)
-                else:
-                    lbl.setStyleSheet(neutral_style)
-            else:
-                lbl.setStyleSheet(neutral_style)
-        equity_curve = result.get("equity_curve", [])
-        if equity_curve:
-            points = [(i, eq) for i, eq in enumerate(equity_curve)]
-            self.equity_curve_final.set_points(points)
-        self._log("Final backtest completed.", "result")
-        for k, v in metrics.items():
-            self._log_file.write("result", f"{k}: {v}")
+        baseline_metrics = result["baseline_metrics"]
+        filtered_metrics = result["filtered_metrics"]
+        baseline_trades = result["baseline_trades"]
+        filtered_trades = result["filtered_trades"]
+        n_bars = result["n_bars"]
+
+        # Dual equity curve
+        baseline_equity = result.get("baseline_equity_curve", [])
+        filtered_equity = result.get("filtered_equity_curve", [])
+        if baseline_equity and filtered_equity:
+            base_pts = [(i, eq) for i, eq in enumerate(baseline_equity)]
+            filt_pts = [(i, eq) for i, eq in enumerate(filtered_equity)]
+            self.equity_curve_final.set_points_dual(base_pts, filt_pts)
+        else:
+            self.equity_curve_final.clear()
+
+        self._populate_final_results_table(baseline_metrics, filtered_metrics, baseline_trades, filtered_trades)
+
+        self._log("Final backtest complete.", "result")
+        self._log_file.write("result", f"Baseline Net Profit: ${baseline_metrics.get('net_profit', 0):,.2f}")
+        self._log_file.write("result", f"Filtered Net Profit: ${filtered_metrics.get('net_profit', 0):,.2f}")
+        self._log_file.write("result", "Baseline vs Filtered comparison completed.")
         self._cleanup_final_worker()
 
     def _on_final_error(self, err: str) -> None:

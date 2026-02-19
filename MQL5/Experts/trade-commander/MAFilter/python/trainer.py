@@ -35,6 +35,7 @@ def train_filter(
     device: Optional[str] = None,
     seed: int = 42,
     out_dir: Optional[Path] = None,
+    model_basename: Optional[str] = None,
     stop_callback: Optional[Callable[[], bool]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     nn_type: str = "Dense (Feedforward)",
@@ -148,19 +149,24 @@ def train_filter(
     if out_dir:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        base = model_basename if model_basename else "best"
         torch.save({
             "model_state": model.state_dict(),
             **scaling,
-        }, out_dir / "best.pt")
-        with open(out_dir / "scaling.json", "w") as f:
+        }, out_dir / f"{base}.pt")
+        with open(out_dir / f"{base}_scaling.json", "w") as f:
             json.dump({k: v for k, v in scaling.items() if k != "dropout"}, f, indent=2)
     return model, scaling, feature_names
 
 
-def load_filter_model(out_dir: Path) -> tuple[nn.Module, dict]:
-    """Load model and scaling from out_dir (best.pt). Returns (model, scaling). Supports Dense, LSTM, GRU."""
+def load_filter_model(out_dir: Path, model_basename: Optional[str] = None) -> tuple[nn.Module, dict]:
+    """Load model and scaling from out_dir. File: {model_basename}.pt or best.pt. Returns (model, scaling)."""
     out_dir = Path(out_dir)
-    data = torch.load(out_dir / "best.pt", map_location="cpu")
+    base = model_basename if model_basename else "best"
+    pt_path = out_dir / f"{base}.pt"
+    if not pt_path.exists():
+        pt_path = out_dir / "best.pt"
+    data = torch.load(pt_path, map_location="cpu")
     n_features = data["n_features"]
     hidden_sizes = tuple(data["hidden_sizes"])
     dropout = data.get("dropout", 0.2)
@@ -182,6 +188,9 @@ def filter_trades_by_nn(
     """Return only trades where NN predicts good (probability >= threshold)."""
     if not trades:
         return []
+    # Run inference on CPU so input tensors (from numpy) and model are on same device
+    model = model.cpu()
+    model.eval()
     X = np.stack([trade_to_features(t) for t in trades])
     mean = np.array(scaling["mean"], dtype=np.float64)
     std = np.array(scaling["std"], dtype=np.float64)
